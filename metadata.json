@@ -1,0 +1,6 @@
+{
+  "name": "NES ROM & Header Studio",
+  "description": "Convert images to NES CHR pattern tables, nametables, and playable .nes ROMs with interactive iNES & NES 2.0 header inspector, generator, and converter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
