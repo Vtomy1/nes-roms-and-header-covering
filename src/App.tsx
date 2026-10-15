@@ -3,15 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { NESHeader, NESGraphicsData, ConversionSettings } from './types/nes';
-import { createDefaultHeader } from './utils/nesHeader';
+import { createDefaultHeader, serializeNESHeader } from './utils/nesHeader';
 import { convertImageToNES } from './utils/imageToNes';
 import { buildCompleteNESRom, downloadBlob } from './utils/romBuilder';
 import { HeaderInspector } from './components/HeaderInspector';
 import { ImageConverter } from './components/ImageConverter';
 import { PpuViewer } from './components/PpuViewer';
-import { RomHeaderConverter } from './components/RomHeaderConverter';
+import { RomHeaderConverter, UploadedRomMeta } from './components/RomHeaderConverter';
+import { RomStructureVisualizer } from './components/RomStructureVisualizer';
+import { NametableEditor } from './components/NametableEditor';
 import {
   Cpu,
   Layers,
@@ -20,6 +22,8 @@ import {
   FileCode,
   Sparkles,
   BookOpen,
+  Binary,
+  Grid,
 } from 'lucide-react';
 
 export default function App() {
@@ -27,6 +31,7 @@ export default function App() {
   const [graphics, setGraphics] = useState<NESGraphicsData | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [currentImageSource, setCurrentImageSource] = useState<HTMLImageElement | ImageData | null>(null);
+  const [uploadedRomMeta, setUploadedRomMeta] = useState<UploadedRomMeta | null>(null);
 
   const [settings, setSettings] = useState<ConversionSettings>({
     ditherMethod: 'atkinson',
@@ -83,10 +88,41 @@ export default function App() {
     });
   };
 
+  // Direct nametable graphics update callback
+  const handleUpdateGraphics = useCallback((updated: NESGraphicsData) => {
+    setGraphics(updated);
+  }, []);
+
+  // Re-run original quantization to reset nametable
+  const handleResetNametable = useCallback(() => {
+    if (currentImageSource) {
+      handleProcessImage(currentImageSource);
+    }
+  }, [currentImageSource, handleProcessImage]);
+
+  // Pre-calculate full binary ROM for visualization and export
+  const generatedRom = useMemo(() => {
+    if (!graphics) return null;
+    return buildCompleteNESRom(graphics, header);
+  }, [graphics, header]);
+
+  const activeRomBytes = useMemo(() => {
+    if (uploadedRomMeta) {
+      const newHeaderBytes = serializeNESHeader(header);
+      const combined = new Uint8Array(16 + uploadedRomMeta.romPayload.length);
+      combined.set(newHeaderBytes, 0);
+      combined.set(uploadedRomMeta.romPayload, 16);
+      return combined;
+    }
+    if (generatedRom) {
+      return generatedRom.romBytes;
+    }
+    return null;
+  }, [uploadedRomMeta, header, generatedRom]);
+
   const handleDownloadQuickRom = () => {
-    if (!graphics) return;
-    const { romBytes } = buildCompleteNESRom(graphics, header);
-    downloadBlob(romBytes, 'nes_studio_rom.nes');
+    if (!activeRomBytes) return;
+    downloadBlob(activeRomBytes, uploadedRomMeta ? uploadedRomMeta.fileName : 'nes_studio_rom.nes');
   };
 
   return (
@@ -108,8 +144,14 @@ export default function App() {
             <a href="#ppu-screen" className="hover:text-white transition-colors">
               PPU Display
             </a>
+            <a href="#nametable-editor" className="hover:text-white transition-colors">
+              Nametable Editor
+            </a>
             <a href="#header-architect" className="hover:text-white transition-colors">
               Header Architect
+            </a>
+            <a href="#rom-structure" className="hover:text-white transition-colors">
+              ROM Structure
             </a>
             <a href="#exporter" className="hover:text-white transition-colors">
               ROM Exporter
@@ -201,7 +243,29 @@ export default function App() {
           />
         </section>
 
-        {/* Section 3: ROM Header Architect */}
+        {/* Section 3: Nametable Grid Editor & Tile Placer */}
+        <section id="nametable-editor" className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-1.5 h-4 bg-amber-500 rounded-full" />
+              <h2 className="text-sm font-semibold text-neutral-200">
+                Nametable Grid Editor & Tile Placer
+              </h2>
+            </div>
+            <div className="text-xs text-neutral-400">
+              <span>32×30 Tile Placement</span>
+              <span className="mx-1.5">·</span>
+              <span>16×16 Attribute Mapping</span>
+            </div>
+          </div>
+          <NametableEditor
+            graphics={graphics}
+            onUpdateGraphics={handleUpdateGraphics}
+            onResetToOriginal={handleResetNametable}
+          />
+        </section>
+
+        {/* Section 4: ROM Header Architect */}
         <section id="header-architect" className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -222,7 +286,36 @@ export default function App() {
           />
         </section>
 
-        {/* Section 4: ROM Header Converter & Exporter */}
+        {/* Section 5: ROM Structure & Calculated Hex Layout */}
+        <section id="rom-structure" className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-1.5 h-4 bg-indigo-500 rounded-full" />
+              <h2 className="text-sm font-semibold text-neutral-200">
+                ROM Structure & Calculated Hex Layout
+              </h2>
+            </div>
+            <div className="text-xs text-neutral-400">
+              <span>Header, PRG & CHR Binary Inspector</span>
+              <span className="mx-1.5">·</span>
+              <span>Calculated Offsets</span>
+            </div>
+          </div>
+          {activeRomBytes ? (
+            <RomStructureVisualizer
+              romBytes={activeRomBytes}
+              header={header}
+              graphics={graphics}
+              isGeneratedDisplayer={!uploadedRomMeta}
+            />
+          ) : (
+            <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center text-neutral-400">
+              Generating graphics or load a preset to inspect calculated ROM structure and binary layout.
+            </div>
+          )}
+        </section>
+
+        {/* Section 6: ROM Header Converter & Exporter */}
         <section id="exporter" className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -247,10 +340,12 @@ export default function App() {
             header={header}
             graphics={graphics}
             onHeaderLoaded={(loadedHeader) => setHeader(loadedHeader)}
+            uploadedRomMeta={uploadedRomMeta}
+            onUploadedRomChange={setUploadedRomMeta}
           />
         </section>
 
-        {/* Section 5: NES Technical Reference & Specifications */}
+        {/* Section 7: NES Technical Reference & Specifications */}
         <section id="specs" className="p-6 bg-neutral-900 border border-neutral-800 rounded-xl space-y-4">
           <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 text-neutral-400" />
@@ -295,6 +390,9 @@ export default function App() {
           <div className="flex items-center gap-4">
             <a href="#pipeline" className="hover:text-neutral-200 transition-colors">
               Converter
+            </a>
+            <a href="#nametable-editor" className="hover:text-neutral-200 transition-colors">
+              Nametable
             </a>
             <a href="#header-architect" className="hover:text-neutral-200 transition-colors">
               Header

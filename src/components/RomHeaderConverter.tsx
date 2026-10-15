@@ -21,25 +21,37 @@ import {
   Disc,
 } from 'lucide-react';
 
+export interface UploadedRomMeta {
+  fileName: string;
+  originalSize: number;
+  originalHeader: NESHeader;
+  romPayload: Uint8Array; // PRG + CHR without header
+}
+
 interface RomHeaderConverterProps {
   header: NESHeader;
   graphics: NESGraphicsData | null;
   onHeaderLoaded: (newHeader: NESHeader) => void;
+  uploadedRomMeta?: UploadedRomMeta | null;
+  onUploadedRomChange?: (meta: UploadedRomMeta | null) => void;
 }
 
 export const RomHeaderConverter: React.FC<RomHeaderConverterProps> = ({
   header,
   graphics,
   onHeaderLoaded,
+  uploadedRomMeta: propUploadedRomMeta,
+  onUploadedRomChange,
 }) => {
   const [activeCodeTab, setActiveCodeTab] = useState<'c' | 'asm' | 'hex' | 'header'>('c');
   const [copied, setCopied] = useState<boolean>(false);
-  const [uploadedRomMeta, setUploadedRomMeta] = useState<{
-    fileName: string;
-    originalSize: number;
-    originalHeader: NESHeader;
-    romPayload: Uint8Array; // PRG + CHR without header
-  } | null>(null);
+  const [localUploadedRomMeta, setLocalUploadedRomMeta] = useState<UploadedRomMeta | null>(null);
+
+  const uploadedRomMeta = propUploadedRomMeta !== undefined ? propUploadedRomMeta : localUploadedRomMeta;
+  const setUploadedRomMeta = (meta: UploadedRomMeta | null) => {
+    setLocalUploadedRomMeta(meta);
+    if (onUploadedRomChange) onUploadedRomChange(meta);
+  };
 
   const romInputRef = useRef<HTMLInputElement | null>(null);
 
