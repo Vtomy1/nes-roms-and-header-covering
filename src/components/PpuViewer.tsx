@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { NESGraphicsData, SubPalette } from '../types/nes';
 import { NES_MASTER_PALETTE } from '../utils/nesPalette';
+import { PalettePresets } from './PalettePresets';
 import {
   Tv,
   Grid3X3,
@@ -9,16 +10,31 @@ import {
   Palette as PaletteIcon,
   Eye,
   Info,
+  Sparkles,
 } from 'lucide-react';
 
 interface PpuViewerProps {
   graphics: NESGraphicsData | null;
   onUpdateSubpaletteColor?: (subpalId: number, colorSlot: number, newNesColorIndex: number) => void;
+  onApplyPalettePreset?: (
+    presetSubpalettes: [SubPalette, SubPalette, SubPalette, SubPalette],
+    backdrop: number
+  ) => void;
+  onApplySingleSubpalette?: (
+    subpalId: number,
+    colors: [number, number, number, number]
+  ) => void;
+  onResetOriginalPalette?: () => void;
+  hasOriginalBackup?: boolean;
 }
 
 export const PpuViewer: React.FC<PpuViewerProps> = ({
   graphics,
   onUpdateSubpaletteColor,
+  onApplyPalettePreset,
+  onApplySingleSubpalette,
+  onResetOriginalPalette,
+  hasOriginalBackup = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const patternCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -419,6 +435,18 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Historical Palette Presets Section */}
+      {onApplyPalettePreset && (
+        <PalettePresets
+          currentSubpalettes={graphics.subPalettes}
+          currentBackdrop={graphics.universalBackdrop}
+          onApplyPreset={onApplyPalettePreset}
+          onApplySingleSubpalette={onApplySingleSubpalette}
+          onResetOriginal={onResetOriginalPalette}
+          hasOriginalBackup={hasOriginalBackup}
+        />
+      )}
 
       {/* Palette Color Picker Modal */}
       {editingPaletteSlot && (

@@ -4,16 +4,18 @@
  */
 
 import React, { useState, useCallback, useMemo } from 'react';
-import { NESHeader, NESGraphicsData, ConversionSettings } from './types/nes';
+import { NESHeader, NESGraphicsData, ConversionSettings, SubPalette } from './types/nes';
 import { createDefaultHeader, serializeNESHeader } from './utils/nesHeader';
 import { convertImageToNES } from './utils/imageToNes';
 import { buildCompleteNESRom, downloadBlob } from './utils/romBuilder';
+import { renderFullNametableImage } from './utils/nametableRenderer';
 import { HeaderInspector } from './components/HeaderInspector';
 import { ImageConverter } from './components/ImageConverter';
 import { PpuViewer } from './components/PpuViewer';
 import { RomHeaderConverter, UploadedRomMeta } from './components/RomHeaderConverter';
 import { RomStructureVisualizer } from './components/RomStructureVisualizer';
 import { NametableEditor } from './components/NametableEditor';
+import { PatternTableEditor } from './components/PatternTableEditor';
 import {
   Cpu,
   Layers,
@@ -24,6 +26,7 @@ import {
   BookOpen,
   Binary,
   Grid,
+  Edit3,
 } from 'lucide-react';
 
 export default function App() {
@@ -32,6 +35,8 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [currentImageSource, setCurrentImageSource] = useState<HTMLImageElement | ImageData | null>(null);
   const [uploadedRomMeta, setUploadedRomMeta] = useState<UploadedRomMeta | null>(null);
+  const [originalSubPalettes, setOriginalSubPalettes] = useState<[SubPalette, SubPalette, SubPalette, SubPalette] | null>(null);
+  const [originalBackdrop, setOriginalBackdrop] = useState<number | null>(null);
 
   const [settings, setSettings] = useState<ConversionSettings>({
     ditherMethod: 'atkinson',
@@ -51,6 +56,13 @@ export default function App() {
       try {
         const result = await convertImageToNES(source, settings);
         setGraphics(result);
+        setOriginalSubPalettes([
+          { id: 0, colors: [...result.subPalettes[0].colors] },
+          { id: 1, colors: [...result.subPalettes[1].colors] },
+          { id: 2, colors: [...result.subPalettes[2].colors] },
+          { id: 3, colors: [...result.subPalettes[3].colors] },
+        ]);
+        setOriginalBackdrop(result.universalBackdrop);
       } catch (err) {
         console.error('Image conversion error:', err);
       } finally {
@@ -61,32 +73,130 @@ export default function App() {
   );
 
   // Update a subpalette color directly from PPU inspector
-  const handleUpdateSubpaletteColor = (
-    subpalId: number,
-    colorSlot: number,
-    newNesColorIndex: number
-  ) => {
-    if (!graphics) return;
-    const updatedSubpalettes = [...graphics.subPalettes] as [any, any, any, any];
-    updatedSubpalettes[subpalId] = {
-      ...updatedSubpalettes[subpalId],
-      colors: [...updatedSubpalettes[subpalId].colors] as [number, number, number, number],
-    };
-    updatedSubpalettes[subpalId].colors[colorSlot] = newNesColorIndex;
+  const handleUpdateSubpaletteColor = useCallback(
+    (
+      subpalId: number,
+      colorSlot: number,
+      newNesColorIndex: number
+    ) => {
+      if (!graphics) return;
+      const updatedSubpalettes = [...graphics.subPalettes] as [
+        SubPalette,
+        SubPalette,
+        SubPalette,
+        SubPalette
+      ];
+      updatedSubpalettes[subpalId] = {
+        ...updatedSubpalettes[subpalId],
+        colors: [...updatedSubpalettes[subpalId].colors] as [number, number, number, number],
+      };
+      updatedSubpalettes[subpalId].colors[colorSlot] = newNesColorIndex;
 
-    // If colorSlot is 0 (universal backdrop), sync all subpalettes
-    if (colorSlot === 0) {
-      for (let i = 0; i < 4; i++) {
-        updatedSubpalettes[i].colors[0] = newNesColorIndex;
+      // If colorSlot is 0 (universal backdrop), sync all subpalettes
+      if (colorSlot === 0) {
+        for (let i = 0; i < 4; i++) {
+          updatedSubpalettes[i] = {
+            ...updatedSubpalettes[i],
+            colors: [
+              newNesColorIndex,
+              updatedSubpalettes[i].colors[1],
+              updatedSubpalettes[i].colors[2],
+              updatedSubpalettes[i].colors[3],
+            ],
+          };
+        }
       }
-    }
 
-    setGraphics({
+      const updatedGraphics: NESGraphicsData = {
+        ...graphics,
+        universalBackdrop: colorSlot === 0 ? newNesColorIndex : graphics.universalBackdrop,
+        subPalettes: updatedSubpalettes,
+      };
+      updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
+      setGraphics(updatedGraphics);
+    },
+    [graphics]
+  );
+
+  // Apply complete historical palette preset (all 4 subpalettes + backdrop)
+  const handleApplyPalettePreset = useCallback(
+    (
+      presetSubpalettes: [SubPalette, SubPalette, SubPalette, SubPalette],
+      backdrop: number
+    ) => {
+      if (!graphics) return;
+      const updatedGraphics: NESGraphicsData = {
+        ...graphics,
+        universalBackdrop: backdrop,
+        subPalettes: presetSubpalettes,
+      };
+      updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
+      setGraphics(updatedGraphics);
+    },
+    [graphics]
+  );
+
+  // Apply a single historical subpalette to a target slot
+  const handleApplySingleSubpalette = useCallback(
+    (
+      targetSubpalId: number,
+      colors: [number, number, number, number]
+    ) => {
+      if (!graphics) return;
+      const updatedSubpalettes = [...graphics.subPalettes] as [
+        SubPalette,
+        SubPalette,
+        SubPalette,
+        SubPalette
+      ];
+      let backdrop = graphics.universalBackdrop;
+      if (targetSubpalId === 0) {
+        backdrop = colors[0];
+        for (let i = 0; i < 4; i++) {
+          updatedSubpalettes[i] = {
+            id: i,
+            colors: [
+              colors[0],
+              i === 0 ? colors[1] : updatedSubpalettes[i].colors[1],
+              i === 0 ? colors[2] : updatedSubpalettes[i].colors[2],
+              i === 0 ? colors[3] : updatedSubpalettes[i].colors[3],
+            ],
+          };
+        }
+      } else {
+        updatedSubpalettes[targetSubpalId] = {
+          id: targetSubpalId,
+          colors: [backdrop, colors[1], colors[2], colors[3]],
+        };
+      }
+      const updatedGraphics: NESGraphicsData = {
+        ...graphics,
+        universalBackdrop: backdrop,
+        subPalettes: updatedSubpalettes,
+      };
+      updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
+      setGraphics(updatedGraphics);
+    },
+    [graphics]
+  );
+
+  // Revert back to image's original quantized colors
+  const handleResetOriginalPalette = useCallback(() => {
+    if (!graphics || !originalSubPalettes || originalBackdrop === null) return;
+    const restoredSubpalettes: [SubPalette, SubPalette, SubPalette, SubPalette] = [
+      { id: 0, colors: [...originalSubPalettes[0].colors] },
+      { id: 1, colors: [...originalSubPalettes[1].colors] },
+      { id: 2, colors: [...originalSubPalettes[2].colors] },
+      { id: 3, colors: [...originalSubPalettes[3].colors] },
+    ];
+    const updatedGraphics: NESGraphicsData = {
       ...graphics,
-      universalBackdrop: colorSlot === 0 ? newNesColorIndex : graphics.universalBackdrop,
-      subPalettes: updatedSubpalettes,
-    });
-  };
+      universalBackdrop: originalBackdrop,
+      subPalettes: restoredSubpalettes,
+    };
+    updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
+    setGraphics(updatedGraphics);
+  }, [graphics, originalSubPalettes, originalBackdrop]);
 
   // Direct nametable graphics update callback
   const handleUpdateGraphics = useCallback((updated: NESGraphicsData) => {
@@ -146,6 +256,9 @@ export default function App() {
             </a>
             <a href="#nametable-editor" className="hover:text-white transition-colors">
               Nametable Editor
+            </a>
+            <a href="#pattern-editor" className="hover:text-white transition-colors">
+              Pattern Editor
             </a>
             <a href="#header-architect" className="hover:text-white transition-colors">
               Header Architect
@@ -240,6 +353,10 @@ export default function App() {
           <PpuViewer
             graphics={graphics}
             onUpdateSubpaletteColor={handleUpdateSubpaletteColor}
+            onApplyPalettePreset={handleApplyPalettePreset}
+            onApplySingleSubpalette={handleApplySingleSubpalette}
+            onResetOriginalPalette={handleResetOriginalPalette}
+            hasOriginalBackup={!!originalSubPalettes}
           />
         </section>
 
@@ -265,7 +382,28 @@ export default function App() {
           />
         </section>
 
-        {/* Section 4: ROM Header Architect */}
+        {/* Section 4: Pattern Table Editor (8×8 Tile Pixel Studio) */}
+        <section id="pattern-editor" className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-1.5 h-4 bg-cyan-500 rounded-full" />
+              <h2 className="text-sm font-semibold text-neutral-200">
+                Pattern Table Editor (8×8 Tile Pixel Studio)
+              </h2>
+            </div>
+            <div className="text-xs text-neutral-400">
+              <span>2bpp Planar Pixel Matrix</span>
+              <span className="mx-1.5">·</span>
+              <span>512 Tiles ($0000–$1FFF)</span>
+            </div>
+          </div>
+          <PatternTableEditor
+            graphics={graphics}
+            onUpdateGraphics={handleUpdateGraphics}
+          />
+        </section>
+
+        {/* Section 5: ROM Header Architect */}
         <section id="header-architect" className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -286,7 +424,7 @@ export default function App() {
           />
         </section>
 
-        {/* Section 5: ROM Structure & Calculated Hex Layout */}
+        {/* Section 6: ROM Structure & Calculated Hex Layout */}
         <section id="rom-structure" className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -315,7 +453,7 @@ export default function App() {
           )}
         </section>
 
-        {/* Section 6: ROM Header Converter & Exporter */}
+        {/* Section 7: ROM Header Converter & Exporter */}
         <section id="exporter" className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -345,7 +483,7 @@ export default function App() {
           />
         </section>
 
-        {/* Section 7: NES Technical Reference & Specifications */}
+        {/* Section 8: NES Technical Reference & Specifications */}
         <section id="specs" className="p-6 bg-neutral-900 border border-neutral-800 rounded-xl space-y-4">
           <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 text-neutral-400" />
@@ -393,6 +531,9 @@ export default function App() {
             </a>
             <a href="#nametable-editor" className="hover:text-neutral-200 transition-colors">
               Nametable
+            </a>
+            <a href="#pattern-editor" className="hover:text-neutral-200 transition-colors">
+              Pattern
             </a>
             <a href="#header-architect" className="hover:text-neutral-200 transition-colors">
               Header
