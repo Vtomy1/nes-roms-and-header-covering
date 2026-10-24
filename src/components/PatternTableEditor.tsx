@@ -105,7 +105,7 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
   );
 
   // Handle Undo
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (historyIndex <= 0) return;
     const prev = history[historyIndex - 1];
     setHistoryIndex(historyIndex - 1);
@@ -113,10 +113,10 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     setActivePatternTable(Math.floor(prev.tileId / 256));
     setPixels(new Uint8Array(prev.pixels));
     commitPixels(prev.pixels);
-  };
+  }, [historyIndex, history, commitPixels]);
 
   // Handle Redo
-  const handleRedo = () => {
+  const handleRedo = useCallback(() => {
     if (historyIndex >= history.length - 1) return;
     const next = history[historyIndex + 1];
     setHistoryIndex(historyIndex + 1);
@@ -124,7 +124,7 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     setActivePatternTable(Math.floor(next.tileId / 256));
     setPixels(new Uint8Array(next.pixels));
     commitPixels(next.pixels);
-  };
+  }, [historyIndex, history, commitPixels]);
 
   // Modify pixel at (px, py)
   const setPixelAt = useCallback(
@@ -211,7 +211,7 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
   };
 
   // Transformations
-  const rotateTile90 = () => {
+  const rotateTile90 = useCallback(() => {
     pushHistory(fullTileId, pixels);
     const rotated = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
@@ -221,9 +221,9 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     }
     setPixels(rotated);
     commitPixels(rotated);
-  };
+  }, [fullTileId, pixels, pushHistory, commitPixels]);
 
-  const flipTileH = () => {
+  const flipTileH = useCallback(() => {
     pushHistory(fullTileId, pixels);
     const flipped = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
@@ -233,9 +233,9 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     }
     setPixels(flipped);
     commitPixels(flipped);
-  };
+  }, [fullTileId, pixels, pushHistory, commitPixels]);
 
-  const flipTileV = () => {
+  const flipTileV = useCallback(() => {
     pushHistory(fullTileId, pixels);
     const flipped = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
@@ -245,7 +245,42 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     }
     setPixels(flipped);
     commitPixels(flipped);
-  };
+  }, [fullTileId, pixels, pushHistory, commitPixels]);
+
+  // Keyboard shortcuts for H-flip, V-flip, Rotate, Undo, Redo
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement)?.tagName)) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        handleRedo();
+      } else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key === 'h' || e.key === 'H') {
+          e.preventDefault();
+          flipTileH();
+        } else if (e.key === 'v' || e.key === 'V') {
+          e.preventDefault();
+          flipTileV();
+        } else if (e.key === 'r' || e.key === 'R') {
+          e.preventDefault();
+          rotateTile90();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo, flipTileH, flipTileV, rotateTile90]);
 
   const shiftTile = (dx: number, dy: number) => {
     pushHistory(fullTileId, pixels);
@@ -511,27 +546,27 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
             <div className="grid grid-cols-3 gap-1.5">
               <button
                 onClick={rotateTile90}
-                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors"
-                title="Rotate 90° Clockwise"
+                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors group"
+                title="Rotate 90° Clockwise (Shortcut: R)"
               >
-                <RotateCw className="w-3.5 h-3.5" />
+                <RotateCw className="w-3.5 h-3.5 text-cyan-400 group-hover:rotate-45 transition-transform" />
                 <span className="text-[10px]">Rot 90°</span>
               </button>
               <button
                 onClick={flipTileH}
-                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors"
-                title="Flip Horizontal (Mirror X)"
+                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors group"
+                title="Flip Horizontal (Mirror X) (Shortcut: H)"
               >
-                <FlipHorizontal className="w-3.5 h-3.5" />
-                <span className="text-[10px]">Flip H</span>
+                <FlipHorizontal className="w-3.5 h-3.5 text-cyan-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px]">Flip H (H)</span>
               </button>
               <button
                 onClick={flipTileV}
-                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors"
-                title="Flip Vertical (Mirror Y)"
+                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 text-xs flex flex-col items-center gap-1 transition-colors group"
+                title="Flip Vertical (Mirror Y) (Shortcut: V)"
               >
-                <FlipVertical className="w-3.5 h-3.5" />
-                <span className="text-[10px]">Flip V</span>
+                <FlipVertical className="w-3.5 h-3.5 text-cyan-400 group-hover:scale-110 transition-transform" />
+                <span className="text-[10px]">Flip V (V)</span>
               </button>
             </div>
 
@@ -679,13 +714,38 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
 
         {/* Center Column: Interactive 8×8 Pixel Grid Canvas (5 Cols on XL) */}
         <div className="xl:col-span-5 flex flex-col items-center justify-center p-4 bg-neutral-950 rounded-xl border border-neutral-800 space-y-4">
-          <div className="flex items-center justify-between w-full text-xs">
-            <span className="font-semibold text-neutral-200 flex items-center gap-1.5">
-              <span>8×8 Pixel Matrix</span>
-              <span className="font-mono text-cyan-400">
-                (${selectedTileId.toString(16).padStart(2, '0').toUpperCase()} / {selectedTileId})
+          <div className="flex flex-wrap items-center justify-between w-full gap-2 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-neutral-200 flex items-center gap-1.5">
+                <span>8×8 Pixel Matrix</span>
+                <span className="font-mono text-cyan-400">
+                  (${selectedTileId.toString(16).padStart(2, '0').toUpperCase()} / {selectedTileId})
+                </span>
               </span>
-            </span>
+
+              {/* Direct H-Flip and V-Flip Action Buttons above Canvas */}
+              <div className="flex items-center gap-1 ml-1.5">
+                <button
+                  type="button"
+                  onClick={flipTileH}
+                  className="px-2 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 hover:border-cyan-600/50 text-neutral-300 hover:text-cyan-200 text-[11px] font-medium flex items-center gap-1 transition-colors shadow-xs"
+                  title="Flip Tile Horizontally (Shortcut: H)"
+                >
+                  <FlipHorizontal className="w-3 h-3 text-cyan-400" />
+                  <span>H-Flip</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={flipTileV}
+                  className="px-2 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 hover:border-cyan-600/50 text-neutral-300 hover:text-cyan-200 text-[11px] font-medium flex items-center gap-1 transition-colors shadow-xs"
+                  title="Flip Tile Vertically (Shortcut: V)"
+                >
+                  <FlipVertical className="w-3 h-3 text-cyan-400" />
+                  <span>V-Flip</span>
+                </button>
+              </div>
+            </div>
+
             <span className="text-[11px] text-neutral-400 font-mono">
               Screen instances: <strong className="text-cyan-300">{screenUsageCount}</strong>
             </span>

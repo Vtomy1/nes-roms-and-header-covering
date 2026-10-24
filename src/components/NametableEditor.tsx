@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { NESGraphicsData, SubPalette } from '../types/nes';
+import { NESGraphicsData, SubPalette, MirroringType } from '../types/nes';
 import { NES_MASTER_PALETTE } from '../utils/nesPalette';
 import {
   renderFullNametableImage,
+  renderQuadNametableImage,
   renderSingleTileImage,
   floodFillNametable,
   setAttributeSubpalette,
@@ -25,12 +26,22 @@ import {
   Square,
   Crosshair,
   FileCheck,
+  Columns,
+  Rows,
+  ArrowLeftRight,
+  ArrowDownUp,
+  Monitor,
+  Split,
+  HardDrive,
+  Cpu,
 } from 'lucide-react';
 
 interface NametableEditorProps {
   graphics: NESGraphicsData | null;
   onUpdateGraphics: (updated: NESGraphicsData) => void;
   onResetToOriginal?: () => void;
+  mirroring?: MirroringType;
+  onUpdateMirroring?: (mirroring: MirroringType) => void;
 }
 
 type EditorTool = 'brush' | 'fill' | 'eyedropper' | 'attribute';
@@ -44,6 +55,8 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
   graphics,
   onUpdateGraphics,
   onResetToOriginal,
+  mirroring = 'vertical',
+  onUpdateMirroring,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const tilePickerCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -57,6 +70,9 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
   const [showTileGrid, setShowTileGrid] = useState<boolean>(true);
   const [showAttrGrid, setShowAttrGrid] = useState<boolean>(false);
   const [isMouseDown, setIsMouseDown] = useState<boolean>(false);
+  const [viewMode, setViewMode] = useState<'single' | 'quad'>('single');
+
+  const activeMirroring: MirroringType = mirroring || 'vertical';
 
   // Hover coordinate info
   const [hoveredCell, setHoveredCell] = useState<{
@@ -65,6 +81,10 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     tileId: number;
     subpalId: number;
     ppuAddr: string;
+    quadrantName?: string;
+    isPage0?: boolean;
+    pixelX?: number;
+    pixelY?: number;
   } | null>(null);
 
   // Undo / Redo history
@@ -124,16 +144,21 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     }
   }, [graphics, history.length]);
 
-  // Re-render main 256x240 screen when graphics change
+  // Re-render main 256x240 screen or 512x480 quad memory space when graphics, viewMode, or mirroring change
   useEffect(() => {
     if (!graphics || !canvasRef.current) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const img = renderFullNametableImage(graphics);
-    ctx.putImageData(img, 0, 0);
-  }, [graphics]);
+    if (viewMode === 'quad') {
+      const quadImg = renderQuadNametableImage(graphics, activeMirroring);
+      ctx.putImageData(quadImg, 0, 0);
+    } else {
+      const img = renderFullNametableImage(graphics);
+      ctx.putImageData(img, 0, 0);
+    }
+  }, [graphics, viewMode, activeMirroring]);
 
   // Render CHR tile picker (16x16 tiles = 256 tiles per pattern table)
   useEffect(() => {
@@ -248,42 +273,135 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     setIsMouseDown(true);
     if (!canvasRef.current) return;
     const rect = canvasRef.current.getBoundingClientRect();
-    const scaleX = 256 / rect.width;
-    const scaleY = 240 / rect.height;
+    const isQuad = viewMode === 'quad';
+    const canvasW = isQuad ? 512 : 256;
+    const canvasH = isQuad ? 480 : 240;
 
-    const x = Math.floor((e.clientX - rect.left) * scaleX);
-    const y = Math.floor((e.clientY - rect.top) * scaleY);
-    const tx = Math.floor(x / 8);
-    const ty = Math.floor(y / 8);
+    const scaleX = canvasW / rect.width;
+    const scaleY = canvasH / rect.height;
 
-    applyToolAt(tx, ty);
+    const rawX = Math.floor((e.clientX - rect.left) * scaleX);
+    const rawY = Math.floor((e.clientY - rect.top) * scaleY);
+
+    if (isQuad) {
+      const qx = Math.floor(rawX / 256);
+      const qy = Math.floor(rawY / 240);
+
+      // Determine if clicked quadrant maps to Page 0
+      let isPage0 = false;
+      if (activeMirroring === 'vertical') {
+        isPage0 = (qx === 0); // TL ($2000) or BL ($2800)
+      } else if (activeMirroring === 'horizontal') {
+        isPage0 = (qy === 0); // TL ($2000) or TR ($2400)
+      } else if (activeMirroring === 'single_screen_0') {
+        isPage0 = true;
+      } else {
+        isPage0 = (qx === 0 && qy === 0);
+      }
+
+      if (isPage0) {
+        const subX = rawX % 256;
+        const subY = rawY % 240;
+        const tx = Math.floor(subX / 8);
+        const ty = Math.floor(subY / 8);
+        applyToolAt(tx, ty);
+      }
+    } else {
+      const tx = Math.floor(rawX / 8);
+      const ty = Math.floor(rawY / 8);
+      applyToolAt(tx, ty);
+    }
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!graphics || !canvasRef.current) return;
     const rect = canvasRef.current.getBoundingClientRect();
-    const scaleX = 256 / rect.width;
-    const scaleY = 240 / rect.height;
+    const isQuad = viewMode === 'quad';
+    const canvasW = isQuad ? 512 : 256;
+    const canvasH = isQuad ? 480 : 240;
 
-    const x = Math.max(0, Math.min(255, Math.floor((e.clientX - rect.left) * scaleX)));
-    const y = Math.max(0, Math.min(239, Math.floor((e.clientY - rect.top) * scaleY)));
-    const tx = Math.floor(x / 8);
-    const ty = Math.floor(y / 8);
+    const scaleX = canvasW / rect.width;
+    const scaleY = canvasH / rect.height;
 
-    // Calculate hover information
-    const tileId = graphics.nametable[ty * 32 + tx] ?? 0;
-    const bx = Math.floor(tx / 2);
-    const by = Math.floor(ty / 2);
-    const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
-    const attrByte = graphics.attributeTable[attrIdx] || 0;
-    const quadrant = ((by % 2) << 1) | (bx % 2);
-    const subpalId = (attrByte >> (quadrant * 2)) & 0x03;
-    const ppuAddr = '$' + (0x2000 + ty * 32 + tx).toString(16).toUpperCase();
+    const rawX = Math.max(0, Math.min(canvasW - 1, Math.floor((e.clientX - rect.left) * scaleX)));
+    const rawY = Math.max(0, Math.min(canvasH - 1, Math.floor((e.clientY - rect.top) * scaleY)));
 
-    setHoveredCell({ tx, ty, tileId, subpalId, ppuAddr });
+    if (isQuad) {
+      const qx = Math.floor(rawX / 256);
+      const qy = Math.floor(rawY / 240);
 
-    if (isMouseDown && (activeTool === 'brush' || activeTool === 'attribute')) {
-      applyToolAt(tx, ty);
+      let isPage0 = false;
+      if (activeMirroring === 'vertical') {
+        isPage0 = (qx === 0);
+      } else if (activeMirroring === 'horizontal') {
+        isPage0 = (qy === 0);
+      } else if (activeMirroring === 'single_screen_0') {
+        isPage0 = true;
+      } else {
+        isPage0 = (qx === 0 && qy === 0);
+      }
+
+      const subX = rawX % 256;
+      const subY = rawY % 240;
+      const tx = Math.floor(subX / 8);
+      const ty = Math.floor(subY / 8);
+
+      const baseAddr = qy === 0 ? (qx === 0 ? 0x2000 : 0x2400) : (qx === 0 ? 0x2800 : 0x2C00);
+      const ppuAddr = '$' + (baseAddr + ty * 32 + tx).toString(16).toUpperCase();
+
+      const tileId = isPage0 ? (graphics.nametable[ty * 32 + tx] ?? 0) : 0;
+      const bx = Math.floor(tx / 2);
+      const by = Math.floor(ty / 2);
+      const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
+      const attrByte = graphics.attributeTable[attrIdx] || 0;
+      const quadrant = ((by % 2) << 1) | (bx % 2);
+      const subpalId = isPage0 ? ((attrByte >> (quadrant * 2)) & 0x03) : 0;
+
+      const quadrantName = qy === 0 ? (qx === 0 ? 'NT 0 ($2000)' : 'NT 1 ($2400)') : (qx === 0 ? 'NT 2 ($2800)' : 'NT 3 ($2C00)');
+
+      setHoveredCell({
+        tx,
+        ty,
+        tileId,
+        subpalId,
+        ppuAddr,
+        quadrantName,
+        isPage0,
+        pixelX: rawX,
+        pixelY: rawY,
+      });
+
+      if (isMouseDown && (activeTool === 'brush' || activeTool === 'attribute') && isPage0) {
+        applyToolAt(tx, ty);
+      }
+    } else {
+      const tx = Math.floor(rawX / 8);
+      const ty = Math.floor(rawY / 8);
+
+      const tileId = graphics.nametable[ty * 32 + tx] ?? 0;
+      const bx = Math.floor(tx / 2);
+      const by = Math.floor(ty / 2);
+      const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
+      const attrByte = graphics.attributeTable[attrIdx] || 0;
+      const quadrant = ((by % 2) << 1) | (bx % 2);
+      const subpalId = (attrByte >> (quadrant * 2)) & 0x03;
+      const ppuAddr = '$' + (0x2000 + ty * 32 + tx).toString(16).toUpperCase();
+
+      setHoveredCell({
+        tx,
+        ty,
+        tileId,
+        subpalId,
+        ppuAddr,
+        quadrantName: 'NT 0 ($2000)',
+        isPage0: true,
+        pixelX: rawX,
+        pixelY: rawY,
+      });
+
+      if (isMouseDown && (activeTool === 'brush' || activeTool === 'attribute')) {
+        applyToolAt(tx, ty);
+      }
     }
   };
 
@@ -397,6 +515,64 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
           >
             <Redo2 className="w-4 h-4" />
           </button>
+
+          <div className="h-5 w-px bg-neutral-800 mx-1" />
+
+          {/* Mirroring Setting Toggle */}
+          <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+            <button
+              onClick={() => onUpdateMirroring?.('horizontal')}
+              className={`px-2.5 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                activeMirroring === 'horizontal'
+                  ? 'bg-amber-600 text-white shadow-sm font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Horizontal Mirroring: Top row ($2000 & $2400) share Page 0. Best for Vertical Scrolling (Ice Climber, Kid Icarus)."
+            >
+              <ArrowLeftRight className="w-3.5 h-3.5" />
+              <span>H-Mirror</span>
+            </button>
+            <button
+              onClick={() => onUpdateMirroring?.('vertical')}
+              className={`px-2.5 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                activeMirroring === 'vertical'
+                  ? 'bg-amber-600 text-white shadow-sm font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Vertical Mirroring: Left col ($2000 & $2800) share Page 0. Best for Horizontal Scrolling (Super Mario Bros, Zelda)."
+            >
+              <ArrowDownUp className="w-3.5 h-3.5" />
+              <span>V-Mirror</span>
+            </button>
+          </div>
+
+          {/* View Mode: Single Screen vs 2x2 Quad Memory Map */}
+          <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+            <button
+              onClick={() => setViewMode('single')}
+              className={`px-2 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                viewMode === 'single'
+                  ? 'bg-neutral-800 text-white font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Single Nametable View (32×30 tiles / 256×240 px)"
+            >
+              <Monitor className="w-3.5 h-3.5" />
+              <span>1× Screen</span>
+            </button>
+            <button
+              onClick={() => setViewMode('quad')}
+              className={`px-2 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                viewMode === 'quad'
+                  ? 'bg-neutral-800 text-amber-300 font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="2×2 Quad Memory Map (64×60 tiles / 512×480 px) - Shows how tiles reflect across PPU address space"
+            >
+              <Split className="w-3.5 h-3.5" />
+              <span>2×2 Quad VRAM</span>
+            </button>
+          </div>
 
           <div className="h-5 w-px bg-neutral-800 mx-1" />
 
@@ -626,17 +802,17 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
         {/* Center: Interactive Nametable Canvas Viewport (6 Cols on XL) */}
         <div className="xl:col-span-6 flex flex-col items-center justify-center p-4 bg-neutral-950 rounded-xl border border-neutral-800 overflow-hidden relative">
           <div
-            className="relative select-none"
+            className="relative select-none max-w-full"
             style={{
-              width: 256 * zoomLevel,
-              height: 240 * zoomLevel,
+              width: viewMode === 'quad' ? (zoomLevel === 1 ? 384 : zoomLevel === 2 ? 512 : 640) : 256 * zoomLevel,
+              height: viewMode === 'quad' ? (zoomLevel === 1 ? 360 : zoomLevel === 2 ? 480 : 600) : 240 * zoomLevel,
             }}
           >
             {/* Live Canvas */}
             <canvas
               ref={canvasRef}
-              width={256}
-              height={240}
+              width={viewMode === 'quad' ? 512 : 256}
+              height={viewMode === 'quad' ? 480 : 240}
               onMouseDown={handleCanvasMouseDown}
               onMouseMove={handleCanvasMouseMove}
               onMouseUp={handleCanvasMouseUp}
@@ -651,8 +827,36 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
               }`}
             />
 
-            {/* 8×8 Tile Grid Lines */}
-            {showTileGrid && (
+            {/* In Quad mode: 4 Quadrant Split Dividers & VRAM Markers */}
+            {viewMode === 'quad' && (
+              <>
+                {/* Horizontal divider between top quadrants ($2000/$2400) and bottom quadrants ($2800/$2C00) */}
+                <div className="absolute left-0 right-0 top-1/2 h-0.5 bg-amber-500/50 pointer-events-none shadow-sm" />
+                {/* Vertical divider between left quadrants ($2000/$2800) and right quadrants ($2400/$2C00) */}
+                <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-amber-500/50 pointer-events-none shadow-sm" />
+
+                {/* Quadrant corner markers */}
+                <div className="absolute top-1 left-1.5 px-1.5 py-0.5 rounded bg-black/85 border border-amber-500/60 text-[9px] font-mono text-amber-300 pointer-events-none shadow">
+                  $2000 · CIRAM 0 (Primary)
+                </div>
+                <div className={`absolute top-1 right-1.5 px-1.5 py-0.5 rounded bg-black/85 border text-[9px] font-mono pointer-events-none shadow ${
+                  activeMirroring === 'horizontal' ? 'border-amber-500/80 text-amber-300' : 'border-neutral-700/60 text-neutral-400'
+                }`}>
+                  $2400 · {activeMirroring === 'horizontal' ? 'CIRAM 0 (Mirrored ⇄)' : 'CIRAM 1 (Secondary)'}
+                </div>
+                <div className={`absolute bottom-1 left-1.5 px-1.5 py-0.5 rounded bg-black/85 border text-[9px] font-mono pointer-events-none shadow ${
+                  activeMirroring === 'vertical' ? 'border-amber-500/80 text-amber-300' : 'border-neutral-700/60 text-neutral-400'
+                }`}>
+                  $2800 · {activeMirroring === 'vertical' ? 'CIRAM 0 (Mirrored ⇅)' : 'CIRAM 1 (Secondary)'}
+                </div>
+                <div className="absolute bottom-1 right-1.5 px-1.5 py-0.5 rounded bg-black/85 border border-neutral-700/60 text-[9px] font-mono text-neutral-400 pointer-events-none shadow">
+                  $2C00 · {activeMirroring === 'horizontal' ? 'CIRAM 1 (Mirrored ⇄)' : activeMirroring === 'vertical' ? 'CIRAM 1 (Mirrored ⇅)' : 'CIRAM 1'}
+                </div>
+              </>
+            )}
+
+            {/* 8×8 Tile Grid Lines (in Single view mode) */}
+            {showTileGrid && viewMode === 'single' && (
               <div
                 className="absolute inset-0 pointer-events-none"
                 style={{
@@ -662,8 +866,8 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
               />
             )}
 
-            {/* 16×16 Attribute Macroblock Grid Lines */}
-            {showAttrGrid && (
+            {/* 16×16 Attribute Macroblock Grid Lines (in Single view mode) */}
+            {showAttrGrid && viewMode === 'single' && (
               <div
                 className="absolute inset-0 pointer-events-none"
                 style={{
@@ -674,7 +878,7 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
             )}
 
             {/* Hover Bounding Box Cursor */}
-            {hoveredCell && (
+            {hoveredCell && viewMode === 'single' && (
               <div
                 className="absolute pointer-events-none border-2 border-amber-400 bg-amber-400/20 transition-none z-10"
                 style={{
@@ -682,6 +886,17 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
                   top: (activeTool === 'attribute' ? Math.floor(hoveredCell.ty / 2) * 16 : hoveredCell.ty * 8) * zoomLevel,
                   width: (activeTool === 'attribute' ? 16 : 8) * zoomLevel,
                   height: (activeTool === 'attribute' ? 16 : 8) * zoomLevel,
+                }}
+              />
+            )}
+            {hoveredCell && viewMode === 'quad' && hoveredCell.pixelX !== undefined && hoveredCell.pixelY !== undefined && (
+              <div
+                className="absolute pointer-events-none border-2 border-amber-400 bg-amber-400/20 transition-none z-10"
+                style={{
+                  left: `${((Math.floor(hoveredCell.pixelX / 8) * 8) / 512) * 100}%`,
+                  top: `${((Math.floor(hoveredCell.pixelY / 8) * 8) / 480) * 100}%`,
+                  width: `${(8 / 512) * 100}%`,
+                  height: `${(8 / 480) * 100}%`,
                 }}
               />
             )}
@@ -703,6 +918,11 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
                 <span className="text-neutral-400">
                   PPU: <strong className="text-emerald-400">{hoveredCell.ppuAddr}</strong>
                 </span>
+                {hoveredCell.quadrantName && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-amber-300">
+                    {hoveredCell.quadrantName}
+                  </span>
+                )}
               </div>
             ) : (
               <span className="text-neutral-400 flex items-center gap-1.5">
@@ -711,8 +931,10 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
               </span>
             )}
 
-            <div className="text-neutral-400 text-[11px]">
-              Active Tool: <span className="uppercase text-amber-300">{activeTool}</span>
+            <div className="text-neutral-400 text-[11px] flex items-center gap-2">
+              <span>Tool: <strong className="uppercase text-amber-300">{activeTool}</strong></span>
+              <span>·</span>
+              <span>Mode: <strong className="text-neutral-200">{viewMode === 'quad' ? '2×2 Quad VRAM' : '1× Screen'}</strong></span>
             </div>
           </div>
         </div>
@@ -806,6 +1028,226 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
             <p className="text-[11px] text-neutral-400 leading-relaxed">
               Every edit to this nametable immediately updates the bootable 6502 ROM payload, the PPU display, and the ROM binary layout before export.
             </p>
+          </div>
+        </div>
+      </div>
+
+      {/* PPU VRAM Nametable Mirroring & Memory Reflection Architecture Section */}
+      <div className="bg-neutral-950/80 border border-neutral-800 rounded-xl p-4 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-neutral-800/80">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 bg-amber-500/10 text-amber-400 rounded-lg">
+              <Split className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-xs font-semibold text-neutral-100 uppercase tracking-wider">
+                  PPU VRAM Nametable Mirroring Architecture
+                </h3>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-amber-300 font-mono">
+                  {activeMirroring === 'vertical' ? 'Vertical Mirroring ($01)' : 'Horizontal Mirroring ($00)'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-400">
+                Configure how the NES PPU maps its 4 nametable address slots ($2000–$2FFF) to physical 2KB CIRAM pages
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-neutral-400 font-mono">
+              iNES Byte 6: <strong className="text-amber-300">{activeMirroring === 'vertical' ? 'Bit 0 = 1 ($01)' : 'Bit 0 = 0 ($00)'}</strong>
+            </span>
+          </div>
+        </div>
+
+        {/* 2-Card Mirroring Selector */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {/* Horizontal Mirroring Card */}
+          <button
+            onClick={() => onUpdateMirroring?.('horizontal')}
+            className={`p-3.5 rounded-xl border text-left transition-all relative flex flex-col justify-between gap-3 ${
+              activeMirroring === 'horizontal'
+                ? 'border-amber-500 bg-amber-950/20 shadow-md ring-1 ring-amber-500/40'
+                : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700 hover:bg-neutral-900/80'
+            }`}
+          >
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className={`p-1 rounded ${activeMirroring === 'horizontal' ? 'bg-amber-500 text-black' : 'bg-neutral-800 text-neutral-400'}`}>
+                    <ArrowLeftRight className="w-3.5 h-3.5" />
+                  </div>
+                  <span className="text-xs font-bold text-neutral-100">
+                    Horizontal Mirroring
+                  </span>
+                </div>
+                {activeMirroring === 'horizontal' ? (
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500 text-black font-semibold flex items-center gap-1">
+                    <Check className="w-3 h-3" />
+                    Active in ROM
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-mono text-neutral-500">Flag 6 Bit 0 = 0</span>
+                )}
+              </div>
+              <p className="text-[11px] text-neutral-400 leading-relaxed pt-1">
+                Top quadrants ($2000 & $2400) share <strong>CIRAM Page 0</strong>. Bottom quadrants ($2800 & $2C00) share <strong>CIRAM Page 1</strong>.
+              </p>
+            </div>
+
+            <div className="p-2 bg-neutral-950 rounded-lg border border-neutral-800/80 text-[11px] space-y-1">
+              <div className="flex items-center justify-between font-mono text-[10px] text-neutral-400">
+                <span>CIRAM Pin A10: <strong className="text-amber-300">PPU A11</strong></span>
+                <span>Optimized for:</span>
+              </div>
+              <div className="text-neutral-200 font-medium">
+                Vertical Scrolling Games <span className="text-neutral-400 font-normal">(Ice Climber, Kid Icarus, Commando)</span>
+              </div>
+            </div>
+          </button>
+
+          {/* Vertical Mirroring Card */}
+          <button
+            onClick={() => onUpdateMirroring?.('vertical')}
+            className={`p-3.5 rounded-xl border text-left transition-all relative flex flex-col justify-between gap-3 ${
+              activeMirroring === 'vertical'
+                ? 'border-amber-500 bg-amber-950/20 shadow-md ring-1 ring-amber-500/40'
+                : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700 hover:bg-neutral-900/80'
+            }`}
+          >
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className={`p-1 rounded ${activeMirroring === 'vertical' ? 'bg-amber-500 text-black' : 'bg-neutral-800 text-neutral-400'}`}>
+                    <ArrowDownUp className="w-3.5 h-3.5" />
+                  </div>
+                  <span className="text-xs font-bold text-neutral-100">
+                    Vertical Mirroring
+                  </span>
+                </div>
+                {activeMirroring === 'vertical' ? (
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500 text-black font-semibold flex items-center gap-1">
+                    <Check className="w-3 h-3" />
+                    Active in ROM
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-mono text-neutral-500">Flag 6 Bit 0 = 1</span>
+                )}
+              </div>
+              <p className="text-[11px] text-neutral-400 leading-relaxed pt-1">
+                Left quadrants ($2000 & $2800) share <strong>CIRAM Page 0</strong>. Right quadrants ($2400 & $2C00) share <strong>CIRAM Page 1</strong>.
+              </p>
+            </div>
+
+            <div className="p-2 bg-neutral-950 rounded-lg border border-neutral-800/80 text-[11px] space-y-1">
+              <div className="flex items-center justify-between font-mono text-[10px] text-neutral-400">
+                <span>CIRAM Pin A10: <strong className="text-amber-300">PPU A10</strong></span>
+                <span>Optimized for:</span>
+              </div>
+              <div className="text-neutral-200 font-medium">
+                Horizontal Scrolling Games <span className="text-neutral-400 font-normal">(Super Mario Bros., The Legend of Zelda, Metroid)</span>
+              </div>
+            </div>
+          </button>
+        </div>
+
+        {/* 2x2 Memory Reflection Visualizer Map */}
+        <div className="p-3 bg-neutral-900/80 rounded-xl border border-neutral-800 space-y-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-semibold text-neutral-200 flex items-center gap-1.5">
+              <HardDrive className="w-3.5 h-3.5 text-amber-400" />
+              <span>Physical 2KB CIRAM Reflection Map</span>
+            </span>
+            <span className="text-[11px] text-neutral-400 font-mono">
+              PPU Address Range: $2000–$2FFF
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            {/* Quadrant 0: $2000 */}
+            <div className="p-3 rounded-lg border border-amber-500/60 bg-amber-950/20 flex flex-col justify-between gap-1.5">
+              <div className="flex items-center justify-between font-mono text-[11px]">
+                <strong className="text-amber-300 font-bold">$2000 (Nametable 0)</strong>
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px]">Page 0 (Master)</span>
+              </div>
+              <p className="text-[11px] text-neutral-300">
+                Primary editable nametable currently loaded in studio.
+              </p>
+              <div className="text-[10px] text-neutral-400 font-mono pt-1 border-t border-neutral-800/80">
+                VRAM: $2000–$23FF · 1024 Bytes
+              </div>
+            </div>
+
+            {/* Quadrant 1: $2400 */}
+            <div className={`p-3 rounded-lg border flex flex-col justify-between gap-1.5 ${
+              activeMirroring === 'horizontal'
+                ? 'border-amber-500/60 bg-amber-950/20'
+                : 'border-neutral-800 bg-neutral-950/60 text-neutral-400'
+            }`}>
+              <div className="flex items-center justify-between font-mono text-[11px]">
+                <strong className={activeMirroring === 'horizontal' ? 'text-amber-300 font-bold' : 'text-neutral-300 font-semibold'}>
+                  $2400 (Nametable 1)
+                </strong>
+                <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                  activeMirroring === 'horizontal' ? 'bg-amber-500/20 text-amber-300 font-semibold' : 'bg-neutral-800 text-neutral-400'
+                }`}>
+                  {activeMirroring === 'horizontal' ? 'Page 0 (Mirrored ⇄)' : 'Page 1 (Secondary)'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-300">
+                {activeMirroring === 'horizontal'
+                  ? 'Reflects Page 0 horizontally across PPU address space.'
+                  : 'Independent secondary CIRAM page for horizontal scroll seams.'}
+              </p>
+              <div className="text-[10px] text-neutral-400 font-mono pt-1 border-t border-neutral-800/80">
+                VRAM: $2400–$27FF · 1024 Bytes
+              </div>
+            </div>
+
+            {/* Quadrant 2: $2800 */}
+            <div className={`p-3 rounded-lg border flex flex-col justify-between gap-1.5 ${
+              activeMirroring === 'vertical'
+                ? 'border-amber-500/60 bg-amber-950/20'
+                : 'border-neutral-800 bg-neutral-950/60 text-neutral-400'
+            }`}>
+              <div className="flex items-center justify-between font-mono text-[11px]">
+                <strong className={activeMirroring === 'vertical' ? 'text-amber-300 font-bold' : 'text-neutral-300 font-semibold'}>
+                  $2800 (Nametable 2)
+                </strong>
+                <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                  activeMirroring === 'vertical' ? 'bg-amber-500/20 text-amber-300 font-semibold' : 'bg-neutral-800 text-neutral-400'
+                }`}>
+                  {activeMirroring === 'vertical' ? 'Page 0 (Mirrored ⇅)' : 'Page 1 (Secondary)'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-300">
+                {activeMirroring === 'vertical'
+                  ? 'Reflects Page 0 vertically down PPU address space.'
+                  : 'Independent secondary CIRAM page for vertical scroll seams.'}
+              </p>
+              <div className="text-[10px] text-neutral-400 font-mono pt-1 border-t border-neutral-800/80">
+                VRAM: $2800–$2BFF · 1024 Bytes
+              </div>
+            </div>
+
+            {/* Quadrant 3: $2C00 */}
+            <div className="p-3 rounded-lg border border-neutral-800 bg-neutral-950/60 text-neutral-400 flex flex-col justify-between gap-1.5">
+              <div className="flex items-center justify-between font-mono text-[11px]">
+                <strong className="text-neutral-300 font-semibold">$2C00 (Nametable 3)</strong>
+                <span className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 text-[10px]">
+                  {activeMirroring === 'horizontal' ? 'Page 1 (Mirrored ⇄)' : 'Page 1 (Mirrored ⇅)'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-300">
+                {activeMirroring === 'horizontal'
+                  ? 'Reflects $2800 horizontally across the bottom row.'
+                  : 'Reflects $2400 vertically down the right column.'}
+              </p>
+              <div className="text-[10px] text-neutral-400 font-mono pt-1 border-t border-neutral-800/80">
+                VRAM: $2C00–$2FFF · 1024 Bytes
+              </div>
+            </div>
           </div>
         </div>
       </div>

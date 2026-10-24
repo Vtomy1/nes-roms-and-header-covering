@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useCallback, useMemo } from 'react';
-import { NESHeader, NESGraphicsData, ConversionSettings, SubPalette } from './types/nes';
+import { NESHeader, NESGraphicsData, ConversionSettings, SubPalette, MirroringType } from './types/nes';
 import { createDefaultHeader, serializeNESHeader } from './utils/nesHeader';
 import { convertImageToNES } from './utils/imageToNes';
 import { buildCompleteNESRom, downloadBlob } from './utils/romBuilder';
@@ -210,6 +210,17 @@ export default function App() {
     }
   }, [currentImageSource, handleProcessImage]);
 
+  // Update nametable mirroring mode
+  const handleUpdateMirroring = useCallback((newMirroring: MirroringType) => {
+    setHeader((prev) => {
+      const updated: NESHeader = { ...prev, mirroring: newMirroring };
+      return {
+        ...updated,
+        rawBytes: serializeNESHeader(updated),
+      };
+    });
+  }, []);
+
   // Pre-calculate full binary ROM for visualization and export
   const generatedRom = useMemo(() => {
     if (!graphics) return null;
@@ -379,6 +390,8 @@ export default function App() {
             graphics={graphics}
             onUpdateGraphics={handleUpdateGraphics}
             onResetToOriginal={handleResetNametable}
+            mirroring={header.mirroring}
+            onUpdateMirroring={handleUpdateMirroring}
           />
         </section>
 
