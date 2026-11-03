@@ -1,6 +1,7 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { NESGraphicsData, SubPalette } from '../types/nes';
 import { NES_MASTER_PALETTE } from '../utils/nesPalette';
+import { renderFullNametableImage } from '../utils/nametableRenderer';
 import { PalettePresets } from './PalettePresets';
 import {
   Tv,
@@ -11,6 +12,14 @@ import {
   Eye,
   Info,
   Sparkles,
+  Play,
+  Pause,
+  RotateCw,
+  ChevronLeft,
+  ChevronRight,
+  Activity,
+  Sliders,
+  Gauge,
 } from 'lucide-react';
 
 interface PpuViewerProps {
@@ -26,6 +35,58 @@ interface PpuViewerProps {
   ) => void;
   onResetOriginalPalette?: () => void;
   hasOriginalBackup?: boolean;
+}
+
+// Helper to compute perceived luminance according to ITU-R BT.601
+function getLuminance(r: number, g: number, b: number): number {
+  return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+}
+
+// Analyze 4-color subpalette contrast spread, step distribution, and color depth rating
+function analyzeSubpaletteContrast(colors: [number, number, number, number]) {
+  const colorObjs = colors.map((idx) => NES_MASTER_PALETTE[idx] || NES_MASTER_PALETTE[0x0F]);
+  const luminances = colorObjs.map((c) => getLuminance(c.r, c.g, c.b));
+
+  const minL = Math.min(...luminances);
+  const maxL = Math.max(...luminances);
+  const spread = maxL - minL;
+
+  // Step differences between sequential color indices
+  const steps: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    steps.push(Math.abs(luminances[i + 1] - luminances[i]));
+  }
+  const minStep = Math.min(...steps);
+
+  let rating = 'Balanced Contrast';
+  let ratingColor = 'text-amber-400';
+  let badgeColor = 'bg-amber-950/60 border-amber-600/50 text-amber-300';
+  let description = 'Moderate dynamic range with standard 2bpp gradient stepping.';
+
+  if (spread >= 140 && minStep >= 20) {
+    rating = 'High Contrast (Sharp Separation)';
+    ratingColor = 'text-emerald-400';
+    badgeColor = 'bg-emerald-950/60 border-emerald-600/50 text-emerald-300';
+    description = 'Clear luminance steps. Excellent legibility on both CRT and LCD.';
+  } else if (spread < 85 || minStep < 15) {
+    rating = 'Low Contrast (Depth Warning)';
+    ratingColor = 'text-rose-400';
+    badgeColor = 'bg-rose-950/60 border-rose-600/50 text-rose-300';
+    description = 'Tight luminance range. Colors may blend together on dark CRT displays.';
+  }
+
+  return {
+    colorObjs,
+    luminances,
+    minL,
+    maxL,
+    spread,
+    minStep,
+    rating,
+    ratingColor,
+    badgeColor,
+    description,
+  };
 }
 
 export const PpuViewer: React.FC<PpuViewerProps> = ({
@@ -46,6 +107,12 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
   const [patternTableIndex, setPatternTableIndex] = useState<number>(0); // 0 = $0000, 1 = $1000
   const [activePaletteIndex, setActivePaletteIndex] = useState<number>(0); // 0..3 for pattern preview
 
+  // Subpalette Override & Auto-Cycling State
+  const [screenSubpalOverride, setScreenSubpalOverride] = useState<number | null>(null); // null = attributes, 0..3 = force
+  const [isCycling, setIsCycling] = useState<boolean>(false);
+  const [cycleSpeedMs, setCycleSpeedMs] = useState<number>(1000); // 500, 1000, 2000
+  const [cycleTarget, setCycleTarget] = useState<'both' | 'screen' | 'pattern'>('both');
+
   const [hoveredTile, setHoveredTile] = useState<{
     tx: number;
     ty: number;
@@ -59,17 +126,48 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
     slot: number;
   } | null>(null);
 
-  // Render main NES 256x240 screen
+  // Auto-Cycle timer across the 4 background subpalettes (0 -> 1 -> 2 -> 3 -> 0)
+  useEffect(() => {
+    if (!isCycling) return;
+
+    const interval = setInterval(() => {
+      if (cycleTarget === 'screen' || cycleTarget === 'both') {
+        setScreenSubpalOverride((prev) => (prev === null ? 0 : (prev + 1) % 4));
+      }
+      if (cycleTarget === 'pattern' || cycleTarget === 'both') {
+        setActivePaletteIndex((prev) => (prev + 1) % 4);
+      }
+    }, cycleSpeedMs);
+
+    return () => clearInterval(interval);
+  }, [isCycling, cycleSpeedMs, cycleTarget]);
+
+  // Render main NES 256x240 screen (with optional subpalette override)
   useEffect(() => {
     if (!graphics || !canvasRef.current) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    if (graphics.previewImageData) {
+    if (screenSubpalOverride !== null) {
+      const rendered = renderFullNametableImage(graphics, screenSubpalOverride);
+      ctx.putImageData(rendered, 0, 0);
+    } else if (graphics.previewImageData) {
       ctx.putImageData(graphics.previewImageData, 0, 0);
+    } else {
+      const rendered = renderFullNametableImage(graphics);
+      ctx.putImageData(rendered, 0, 0);
     }
-  }, [graphics]);
+  }, [graphics, screenSubpalOverride]);
+
+  // Auditioned subpalette contrast analysis
+  const activeAuditionSubpalId =
+    screenSubpalOverride !== null ? screenSubpalOverride : activePaletteIndex;
+  const activeSubpalColors =
+    graphics?.subPalettes[activeAuditionSubpalId]?.colors || [0x0F, 0x16, 0x27, 0x30];
+  const contrastAnalysis = useMemo(() => {
+    return analyzeSubpaletteContrast(activeSubpalColors);
+  }, [activeSubpalColors]);
 
   // Render 128x128 Pattern Table ($0000-$0FFF or $1000-$1FFF)
   useEffect(() => {
@@ -191,6 +289,29 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
         {/* Viewport Display Toggles */}
         <div className="flex flex-wrap items-center gap-1.5">
           <button
+            onClick={() => {
+              if (isCycling) {
+                setIsCycling(false);
+              } else {
+                if (screenSubpalOverride === null && (cycleTarget === 'screen' || cycleTarget === 'both')) {
+                  setScreenSubpalOverride(0);
+                  setActivePaletteIndex(0);
+                }
+                setIsCycling(true);
+              }
+            }}
+            className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all flex items-center gap-1.5 ${
+              isCycling
+                ? 'bg-amber-600/30 border-amber-500 text-amber-300 font-semibold shadow-xs animate-pulse'
+                : 'bg-neutral-800/80 border-neutral-700 text-neutral-400 hover:text-neutral-200'
+            }`}
+            title="Automatically cycle through all 4 background subpalettes to test color depth and visual contrast"
+          >
+            {isCycling ? <Pause className="w-3.5 h-3.5 text-amber-400 fill-current" /> : <Play className="w-3.5 h-3.5 text-amber-400 fill-current" />}
+            <span>{isCycling ? 'Pause Cycle' : 'Cycle Palettes'}</span>
+          </button>
+
+          <button
             onClick={() => setCrtEffect(!crtEffect)}
             className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all flex items-center gap-1.5 ${
               crtEffect
@@ -249,6 +370,151 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
         {/* Main Canvas Viewport (8 Cols on XL) */}
         <div className="xl:col-span-8 flex flex-col items-center justify-center p-4 bg-neutral-950 rounded-xl border border-neutral-800 overflow-hidden relative">
+          {/* Subpalette Cycling & Color Depth Diagnostics Control Strip */}
+          <div className="w-full mb-3.5 p-2.5 bg-neutral-900/95 rounded-xl border border-neutral-800 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+            {/* Left: Mode / Subpalette Selector */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-neutral-300 flex items-center gap-1.5 mr-1">
+                <RotateCw className={`w-3.5 h-3.5 ${isCycling ? 'animate-spin text-amber-400' : 'text-neutral-400'}`} />
+                <span>Audition:</span>
+              </span>
+
+              <button
+                onClick={() => {
+                  setIsCycling(false);
+                  setScreenSubpalOverride(null);
+                }}
+                className={`px-2 py-1 rounded text-[11px] font-medium border transition-colors ${
+                  screenSubpalOverride === null
+                    ? 'bg-blue-600/30 border-blue-500 text-blue-200 font-semibold'
+                    : 'bg-neutral-950 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                }`}
+                title="Render with 16x16 attribute table subpalette mappings"
+              >
+                Normal (Attributes)
+              </button>
+
+              {[0, 1, 2, 3].map((spId) => {
+                const isSelected = screenSubpalOverride === spId;
+                return (
+                  <button
+                    key={spId}
+                    onClick={() => {
+                      setIsCycling(false);
+                      setScreenSubpalOverride(spId);
+                      setActivePaletteIndex(spId);
+                    }}
+                    className={`px-2.5 py-1 rounded text-[11px] font-mono border transition-all flex items-center gap-1.5 ${
+                      isSelected
+                        ? 'bg-amber-500/25 border-amber-500 text-amber-200 font-bold shadow-xs'
+                        : 'bg-neutral-950 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                    title={`Force all tiles to Subpalette #${spId}`}
+                  >
+                    <span>Subpal #{spId}</span>
+                    <div className="flex -space-x-1 items-center">
+                      {graphics.subPalettes[spId].colors.slice(1).map((c, i) => (
+                        <span
+                          key={i}
+                          className="w-2.5 h-2.5 rounded-full border border-black/40 shrink-0"
+                          style={{ backgroundColor: NES_MASTER_PALETTE[c]?.hex }}
+                        />
+                      ))}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Right: Auto-Cycle Controls (Play/Pause, Step, Speed, Target) */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+                <button
+                  onClick={() => {
+                    const next = screenSubpalOverride === null ? 3 : (screenSubpalOverride + 3) % 4;
+                    setScreenSubpalOverride(next);
+                    setActivePaletteIndex(next);
+                  }}
+                  className="p-1 text-neutral-400 hover:text-white rounded"
+                  title="Step Previous Subpalette"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+
+                <button
+                  onClick={() => {
+                    if (isCycling) {
+                      setIsCycling(false);
+                    } else {
+                      if (screenSubpalOverride === null) {
+                        setScreenSubpalOverride(0);
+                        setActivePaletteIndex(0);
+                      }
+                      setIsCycling(true);
+                    }
+                  }}
+                  className={`px-2.5 py-1 rounded text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+                    isCycling
+                      ? 'bg-amber-500 text-neutral-950 shadow-xs'
+                      : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+                  }`}
+                  title={isCycling ? 'Pause Subpalette Cycling' : 'Start Auto-Cycling through Subpalettes 0-3'}
+                >
+                  {isCycling ? <Pause className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
+                  <span>{isCycling ? 'Pause' : 'Cycle'}</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    const next = screenSubpalOverride === null ? 0 : (screenSubpalOverride + 1) % 4;
+                    setScreenSubpalOverride(next);
+                    setActivePaletteIndex(next);
+                  }}
+                  className="p-1 text-neutral-400 hover:text-white rounded"
+                  title="Step Next Subpalette"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {/* Speed Selector */}
+              <div className="flex items-center gap-0.5 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800 text-[10px] font-mono">
+                {[500, 1000, 2000].map((speed) => (
+                  <button
+                    key={speed}
+                    onClick={() => setCycleSpeedMs(speed)}
+                    className={`px-1.5 py-0.5 rounded transition-colors ${
+                      cycleSpeedMs === speed
+                        ? 'bg-neutral-800 text-amber-300 font-bold'
+                        : 'text-neutral-400 hover:text-neutral-200'
+                    }`}
+                    title={`Cycle speed: ${speed / 1000}s`}
+                  >
+                    {speed / 1000}s
+                  </button>
+                ))}
+              </div>
+
+              {/* Target Selector */}
+              <div className="flex items-center gap-0.5 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800 text-[10px]">
+                {(['both', 'screen', 'pattern'] as const).map((tgt) => (
+                  <button
+                    key={tgt}
+                    onClick={() => setCycleTarget(tgt)}
+                    className={`px-1.5 py-0.5 rounded capitalize transition-colors ${
+                      cycleTarget === tgt
+                        ? 'bg-neutral-800 text-cyan-300 font-medium'
+                        : 'text-neutral-400 hover:text-neutral-200'
+                    }`}
+                    title={`Apply cycling to ${tgt === 'both' ? 'Screen and CHR Pattern Table' : tgt === 'screen' ? 'Screen only' : 'Pattern Table only'}`}
+                  >
+                    {tgt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <div
             className="relative select-none transition-all duration-150"
             style={{
@@ -256,6 +522,19 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
               height: 240 * zoomLevel,
             }}
           >
+            {/* Subpalette Audition / Cycling HUD Pill */}
+            {(screenSubpalOverride !== null || isCycling) && (
+              <div className="absolute top-2 left-2 pointer-events-none z-10 flex items-center gap-2 px-2.5 py-1 rounded-lg bg-neutral-950/90 backdrop-blur-md border border-amber-500/60 text-amber-200 text-[11px] font-mono shadow-xl">
+                {isCycling && <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />}
+                <span className="font-semibold">
+                  {isCycling ? 'Auto-Cycle' : 'Force Subpal'}: #{screenSubpalOverride ?? activePaletteIndex}
+                </span>
+                <span className="text-neutral-400">
+                  ({contrastAnalysis.spread} ΔY · {contrastAnalysis.rating.split(' ')[0]})
+                </span>
+              </div>
+            )}
+
             {/* Real Canvas */}
             <canvas
               ref={canvasRef}
@@ -333,6 +612,62 @@ export const PpuViewer: React.FC<PpuViewerProps> = ({
 
         {/* Right Side: Subpalettes & Pattern Table Viewer (4 Cols on XL) */}
         <div className="xl:col-span-4 space-y-5">
+          {/* Subpalette Contrast & Color Depth Diagnostics Card */}
+          <div className="p-3.5 bg-neutral-950 rounded-xl border border-neutral-800 space-y-2.5 text-xs">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <Activity className="w-3.5 h-3.5 text-amber-400" />
+                <span className="font-semibold text-neutral-200">
+                  Contrast & Depth Diagnostics
+                </span>
+              </div>
+              <span className={`px-2 py-0.5 text-[10px] font-bold rounded-full border ${contrastAnalysis.badgeColor}`}>
+                {contrastAnalysis.rating}
+              </span>
+            </div>
+
+            <p className="text-[11px] text-neutral-400 leading-relaxed">
+              Auditioning <strong className="text-neutral-200">Subpalette #{activeAuditionSubpalId}</strong>: {contrastAnalysis.description}
+            </p>
+
+            {/* 4-Color Ramp with Luminance Values */}
+            <div className="grid grid-cols-4 gap-1 p-1 bg-neutral-900 rounded-lg border border-neutral-800">
+              {contrastAnalysis.colorObjs.map((col, idx) => {
+                const lum = contrastAnalysis.luminances[idx];
+                return (
+                  <div key={idx} className="flex flex-col items-center p-1 rounded bg-black/40">
+                    <div
+                      className="w-full h-5 rounded border border-black/40 mb-1"
+                      style={{ backgroundColor: col.hex }}
+                    />
+                    <span className="font-mono text-[9px] text-neutral-300 font-bold">
+                      ${col.index.toString(16).padStart(2, '0').toUpperCase()}
+                    </span>
+                    <span className="text-[9px] text-neutral-400 font-mono">
+                      Y: {lum}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Metrics Stats Grid */}
+            <div className="grid grid-cols-3 gap-1.5 pt-1 text-center font-mono text-[10px]">
+              <div className="p-1.5 rounded bg-neutral-900 border border-neutral-800">
+                <div className="text-neutral-500 text-[9px]">LUM SPREAD</div>
+                <div className="font-bold text-neutral-200">{contrastAnalysis.spread} / 255</div>
+              </div>
+              <div className="p-1.5 rounded bg-neutral-900 border border-neutral-800">
+                <div className="text-neutral-500 text-[9px]">MIN STEP</div>
+                <div className="font-bold text-neutral-200">Δ {contrastAnalysis.minStep}</div>
+              </div>
+              <div className="p-1.5 rounded bg-neutral-900 border border-neutral-800">
+                <div className="text-neutral-500 text-[9px]">COLOR DEPTH</div>
+                <div className="font-bold text-cyan-300">2bpp (4-Col)</div>
+              </div>
+            </div>
+          </div>
+
           {/* Subpalette Display */}
           <div className="p-4 bg-neutral-950 rounded-xl border border-neutral-800 space-y-3">
             <div className="flex items-center justify-between">

@@ -6,7 +6,10 @@ import { decodeTile2bpp } from './imageToNes';
  * Renders the full 256x240 NES screen from the current nametable,
  * attribute table, pattern table, and subpalettes.
  */
-export function renderFullNametableImage(graphics: NESGraphicsData): ImageData {
+export function renderFullNametableImage(
+  graphics: NESGraphicsData,
+  overrideSubpalId?: number | null
+): ImageData {
   const width = 256;
   const height = 240;
   const imgData = new ImageData(width, height);
@@ -20,13 +23,16 @@ export function renderFullNametableImage(graphics: NESGraphicsData): ImageData {
       const tileId = nametable[ty * 32 + tx];
       const byteOffset = tileId * 16;
 
-      // Determine subpalette from 16x16 macroblock attribute table
-      const bx = Math.floor(tx / 2);
-      const by = Math.floor(ty / 2);
-      const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
-      const attrByte = attributeTable[attrIdx] || 0;
-      const quadrant = ((by % 2) << 1) | (bx % 2);
-      const subpalId = (attrByte >> (quadrant * 2)) & 0x03;
+      // Determine subpalette from 16x16 macroblock attribute table, or use override
+      let subpalId = overrideSubpalId;
+      if (subpalId === undefined || subpalId === null || subpalId < 0 || subpalId > 3) {
+        const bx = Math.floor(tx / 2);
+        const by = Math.floor(ty / 2);
+        const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
+        const attrByte = attributeTable[attrIdx] || 0;
+        const quadrant = ((by % 2) << 1) | (bx % 2);
+        subpalId = (attrByte >> (quadrant * 2)) & 0x03;
+      }
 
       const pal = subPalettes[subpalId]?.colors || subPalettes[0].colors;
 

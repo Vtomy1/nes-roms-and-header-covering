@@ -25,6 +25,7 @@ import {
   Binary,
   Palette,
   Info,
+  History,
 } from 'lucide-react';
 
 interface PatternTableEditorProps {
@@ -32,9 +33,12 @@ interface PatternTableEditorProps {
   onUpdateGraphics: (updated: NESGraphicsData) => void;
 }
 
-interface TileHistoryState {
-  tileId: number;
-  pixels: Uint8Array; // 64 elements (0..3)
+export interface TileHistoryEntry {
+  tileId: number; // 0..511 (full tile ID including pattern table offset)
+  before: Uint8Array; // 64 elements (0..3) before the action
+  after: Uint8Array; // 64 elements (0..3) after the action
+  actionName: string; // Human-readable description
+  timestamp: number;
 }
 
 export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
@@ -70,85 +74,246 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     setPixels(new Uint8Array(currentPixels));
   }, [currentPixels, fullTileId]);
 
-  // Undo / Redo history for tile edits
-  const [history, setHistory] = useState<TileHistoryState[]>([]);
+  // Undo / Redo history stack for tile edits
+  const [history, setHistory] = useState<TileHistoryEntry[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const [showHistoryDrawer, setShowHistoryDrawer] = useState<boolean>(false);
 
-  // Push to history
-  const pushHistory = useCallback((tileId: number, currentPx: Uint8Array) => {
-    setHistory((prev) => {
-      const sliced = prev.slice(0, historyIndex + 1);
-      return [...sliced, { tileId, pixels: new Uint8Array(currentPx) }];
-    });
-    setHistoryIndex((prev) => prev + 1);
-  }, [historyIndex]);
+  // Synchronized refs to avoid stale closure issues during fast actions/drawing
+  const latestPixelsRef = useRef<Uint8Array>(pixels);
+  useEffect(() => {
+    latestPixelsRef.current = pixels;
+  }, [pixels]);
+
+  const strokeStartPixelsRef = useRef<Uint8Array | null>(null);
+  const strokeTileIdRef = useRef<number | null>(null);
+  const graphicsRef = useRef<NESGraphicsData | null>(graphics);
+  useEffect(() => {
+    graphicsRef.current = graphics;
+  }, [graphics]);
 
   // Commit updated 64 pixels to the global graphics state
   const commitPixels = useCallback(
-    (newPixels: Uint8Array) => {
-      if (!graphics) return;
+    (newPixels: Uint8Array, targetFullTileId?: number) => {
+      const currentG = graphicsRef.current || graphics;
+      if (!currentG) return;
 
+      const tileIdToUse = targetFullTileId !== undefined ? targetFullTileId : fullTileId;
       const encodedBytes = encodeTile2bpp(newPixels);
-      const newPatternTable = new Uint8Array(graphics.patternTable);
-      const byteOffset = fullTileId * 16;
+      const newPatternTable = new Uint8Array(currentG.patternTable);
+      const byteOffset = tileIdToUse * 16;
       newPatternTable.set(encodedBytes, byteOffset);
 
       const updatedGraphics: NESGraphicsData = {
-        ...graphics,
+        ...currentG,
         patternTable: newPatternTable,
       };
       // Re-render full nametable image preview
       updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
+      graphicsRef.current = updatedGraphics;
       onUpdateGraphics(updatedGraphics);
     },
     [graphics, fullTileId, onUpdateGraphics]
   );
 
-  // Handle Undo
+  // Push a new action onto the undo/redo stack
+  const recordAction = useCallback(
+    (tileId: number, beforePx: Uint8Array, afterPx: Uint8Array, actionName: string) => {
+      // Check if anything actually changed between before and after
+      let hasDifference = false;
+      for (let i = 0; i < 64; i++) {
+        if (beforePx[i] !== afterPx[i]) {
+          hasDifference = true;
+          break;
+        }
+      }
+      if (!hasDifference) return;
+
+      setHistory((prev) => {
+        // Discard any redo states ahead of the current pointer
+        const activeBranch = prev.slice(0, historyIndex + 1);
+        const newEntry: TileHistoryEntry = {
+          tileId,
+          before: new Uint8Array(beforePx),
+          after: new Uint8Array(afterPx),
+          actionName,
+          timestamp: Date.now(),
+        };
+
+        // Limit stack to last 60 actions to prevent high memory usage
+        if (activeBranch.length >= 60) {
+          return [...activeBranch.slice(activeBranch.length - 59), newEntry];
+        }
+        return [...activeBranch, newEntry];
+      });
+
+      setHistoryIndex((prev) => Math.min(prev + 1, 59));
+    },
+    [historyIndex]
+  );
+
+  const canUndo = historyIndex >= 0;
+  const canRedo = historyIndex < history.length - 1;
+
+  // Handle Undo: revert to 'before' state of current entry
   const handleUndo = useCallback(() => {
-    if (historyIndex <= 0) return;
-    const prev = history[historyIndex - 1];
-    setHistoryIndex(historyIndex - 1);
-    setSelectedTileId(prev.tileId % 256);
-    setActivePatternTable(Math.floor(prev.tileId / 256));
-    setPixels(new Uint8Array(prev.pixels));
-    commitPixels(prev.pixels);
+    if (historyIndex < 0) return;
+    const entry = history[historyIndex];
+    if (!entry) return;
+
+    const targetTable = Math.floor(entry.tileId / 256);
+    const targetTileInTable = entry.tileId % 256;
+
+    setActivePatternTable(targetTable);
+    setSelectedTileId(targetTileInTable);
+
+    const restored = new Uint8Array(entry.before);
+    setPixels(restored);
+    commitPixels(restored, entry.tileId);
+    setHistoryIndex((prev) => prev - 1);
   }, [historyIndex, history, commitPixels]);
 
-  // Handle Redo
+  // Handle Redo: reapply 'after' state of next entry
   const handleRedo = useCallback(() => {
     if (historyIndex >= history.length - 1) return;
-    const next = history[historyIndex + 1];
-    setHistoryIndex(historyIndex + 1);
-    setSelectedTileId(next.tileId % 256);
-    setActivePatternTable(Math.floor(next.tileId / 256));
-    setPixels(new Uint8Array(next.pixels));
-    commitPixels(next.pixels);
+    const entry = history[historyIndex + 1];
+    if (!entry) return;
+
+    const targetTable = Math.floor(entry.tileId / 256);
+    const targetTileInTable = entry.tileId % 256;
+
+    setActivePatternTable(targetTable);
+    setSelectedTileId(targetTileInTable);
+
+    const reapplied = new Uint8Array(entry.after);
+    setPixels(reapplied);
+    commitPixels(reapplied, entry.tileId);
+    setHistoryIndex((prev) => prev + 1);
   }, [historyIndex, history, commitPixels]);
 
-  // Modify pixel at (px, py)
-  const setPixelAt = useCallback(
-    (px: number, py: number) => {
-      if (px < 0 || px >= 8 || py < 0 || py >= 8) return;
-      const idx = py * 8 + px;
-      const oldVal = pixels[idx];
+  // Jump directly to an arbitrary point in the history timeline
+  const jumpToHistory = useCallback(
+    (targetIndex: number) => {
+      if (targetIndex === historyIndex || targetIndex < -1 || targetIndex >= history.length) return;
+      let currIdx = historyIndex;
+      let lastTileId = fullTileId;
+      let lastPx = pixels;
 
+      if (targetIndex < currIdx) {
+        // Step backwards
+        while (currIdx > targetIndex) {
+          const item = history[currIdx];
+          commitPixels(item.before, item.tileId);
+          lastTileId = item.tileId;
+          lastPx = item.before;
+          currIdx--;
+        }
+      } else {
+        // Step forwards
+        while (currIdx < targetIndex) {
+          currIdx++;
+          const item = history[currIdx];
+          commitPixels(item.after, item.tileId);
+          lastTileId = item.tileId;
+          lastPx = item.after;
+        }
+      }
+
+      setActivePatternTable(Math.floor(lastTileId / 256));
+      setSelectedTileId(lastTileId % 256);
+      setPixels(new Uint8Array(lastPx));
+      setHistoryIndex(targetIndex);
+    },
+    [historyIndex, history, fullTileId, pixels, commitPixels]
+  );
+
+  const handleClearHistory = useCallback(() => {
+    setHistory([]);
+    setHistoryIndex(-1);
+  }, []);
+
+  // Pixel Mouse Interaction Handlers with Stroke Batching
+  const handlePixelMouseDown = useCallback(
+    (col: number, row: number, e: React.MouseEvent) => {
+      e.preventDefault();
+      setIsMouseDown(true);
+      strokeStartPixelsRef.current = new Uint8Array(pixels);
+      strokeTileIdRef.current = fullTileId;
+
+      const idx = row * 8 + col;
+      const oldVal = pixels[idx];
       let newVal = activeDrawColor;
       if (drawMode === 'cycle') {
         newVal = (oldVal + 1) % 4;
-      } else {
-        if (oldVal === activeDrawColor) return; // No change needed
       }
+      if (oldVal === newVal) return;
 
-      pushHistory(fullTileId, pixels);
-
-      const nextPixels = new Uint8Array(pixels);
-      nextPixels[idx] = newVal;
-      setPixels(nextPixels);
-      commitPixels(nextPixels);
+      const next = new Uint8Array(pixels);
+      next[idx] = newVal;
+      setPixels(next);
+      commitPixels(next, fullTileId);
     },
-    [pixels, activeDrawColor, drawMode, fullTileId, pushHistory, commitPixels]
+    [pixels, fullTileId, activeDrawColor, drawMode, commitPixels]
   );
+
+  const handlePixelMouseEnter = useCallback(
+    (col: number, row: number) => {
+      if (!isMouseDown) return;
+      const current = latestPixelsRef.current;
+      const idx = row * 8 + col;
+      const oldVal = current[idx];
+      let newVal = activeDrawColor;
+      if (drawMode === 'cycle') {
+        newVal = (oldVal + 1) % 4;
+      }
+      if (oldVal === newVal) return;
+
+      const next = new Uint8Array(current);
+      next[idx] = newVal;
+      setPixels(next);
+      commitPixels(next, fullTileId);
+    },
+    [isMouseDown, activeDrawColor, drawMode, fullTileId, commitPixels]
+  );
+
+  const handleMouseUpOrLeave = useCallback(() => {
+    if (!isMouseDown) return;
+    setIsMouseDown(false);
+
+    const startPx = strokeStartPixelsRef.current;
+    const tileId = strokeTileIdRef.current ?? fullTileId;
+    const endPx = latestPixelsRef.current;
+
+    if (startPx && endPx) {
+      let diffCount = 0;
+      for (let i = 0; i < 64; i++) {
+        if (startPx[i] !== endPx[i]) {
+          diffCount++;
+        }
+      }
+      if (diffCount > 0) {
+        recordAction(
+          tileId,
+          startPx,
+          endPx,
+          diffCount === 1 ? 'Paint Pixel' : `Paint ${diffCount} Pixels`
+        );
+      }
+    }
+    strokeStartPixelsRef.current = null;
+    strokeTileIdRef.current = null;
+  }, [isMouseDown, fullTileId, recordAction]);
+
+  // Window mouseup listener to catch releases outside grid
+  useEffect(() => {
+    const onGlobalMouseUp = () => {
+      if (isMouseDown) {
+        handleMouseUpOrLeave();
+      }
+    };
+    window.addEventListener('mouseup', onGlobalMouseUp);
+    return () => window.removeEventListener('mouseup', onGlobalMouseUp);
+  }, [isMouseDown, handleMouseUpOrLeave]);
 
   // Render 16x16 tile sheet for the active pattern table ($0000 or $1000)
   useEffect(() => {
@@ -212,40 +377,43 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
 
   // Transformations
   const rotateTile90 = useCallback(() => {
-    pushHistory(fullTileId, pixels);
+    const before = new Uint8Array(pixels);
     const rotated = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
       for (let x = 0; x < 8; x++) {
-        rotated[x * 8 + (7 - y)] = pixels[y * 8 + x];
+        rotated[x * 8 + (7 - y)] = before[y * 8 + x];
       }
     }
     setPixels(rotated);
-    commitPixels(rotated);
-  }, [fullTileId, pixels, pushHistory, commitPixels]);
+    commitPixels(rotated, fullTileId);
+    recordAction(fullTileId, before, rotated, 'Rotate 90° CW');
+  }, [fullTileId, pixels, commitPixels, recordAction]);
 
   const flipTileH = useCallback(() => {
-    pushHistory(fullTileId, pixels);
+    const before = new Uint8Array(pixels);
     const flipped = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
       for (let x = 0; x < 8; x++) {
-        flipped[y * 8 + (7 - x)] = pixels[y * 8 + x];
+        flipped[y * 8 + (7 - x)] = before[y * 8 + x];
       }
     }
     setPixels(flipped);
-    commitPixels(flipped);
-  }, [fullTileId, pixels, pushHistory, commitPixels]);
+    commitPixels(flipped, fullTileId);
+    recordAction(fullTileId, before, flipped, 'Flip Horizontal');
+  }, [fullTileId, pixels, commitPixels, recordAction]);
 
   const flipTileV = useCallback(() => {
-    pushHistory(fullTileId, pixels);
+    const before = new Uint8Array(pixels);
     const flipped = new Uint8Array(64);
     for (let y = 0; y < 8; y++) {
       for (let x = 0; x < 8; x++) {
-        flipped[(7 - y) * 8 + x] = pixels[y * 8 + x];
+        flipped[(7 - y) * 8 + x] = before[y * 8 + x];
       }
     }
     setPixels(flipped);
-    commitPixels(flipped);
-  }, [fullTileId, pixels, pushHistory, commitPixels]);
+    commitPixels(flipped, fullTileId);
+    recordAction(fullTileId, before, flipped, 'Flip Vertical');
+  }, [fullTileId, pixels, commitPixels, recordAction]);
 
   // Keyboard shortcuts for H-flip, V-flip, Rotate, Undo, Redo
   useEffect(() => {
@@ -254,14 +422,14 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
         return;
       }
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'z' || e.code === 'KeyZ')) {
         e.preventDefault();
         if (e.shiftKey) {
           handleRedo();
         } else {
           handleUndo();
         }
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+      } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || e.code === 'KeyY')) {
         e.preventDefault();
         handleRedo();
       } else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -282,44 +450,52 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleUndo, handleRedo, flipTileH, flipTileV, rotateTile90]);
 
-  const shiftTile = (dx: number, dy: number) => {
-    pushHistory(fullTileId, pixels);
-    const shifted = new Uint8Array(64);
-    for (let y = 0; y < 8; y++) {
-      for (let x = 0; x < 8; x++) {
-        const nx = (x + dx + 8) % 8;
-        const ny = (y + dy + 8) % 8;
-        shifted[ny * 8 + nx] = pixels[y * 8 + x];
+  const shiftTile = useCallback(
+    (dx: number, dy: number) => {
+      const before = new Uint8Array(pixels);
+      const shifted = new Uint8Array(64);
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          const nx = (x + dx + 8) % 8;
+          const ny = (y + dy + 8) % 8;
+          shifted[ny * 8 + nx] = before[y * 8 + x];
+        }
       }
-    }
-    setPixels(shifted);
-    commitPixels(shifted);
-  };
+      const dirName = dx === 1 ? 'Right' : dx === -1 ? 'Left' : dy === 1 ? 'Down' : 'Up';
+      setPixels(shifted);
+      commitPixels(shifted, fullTileId);
+      recordAction(fullTileId, before, shifted, `Shift ${dirName}`);
+    },
+    [fullTileId, pixels, commitPixels, recordAction]
+  );
 
-  const invertColors = () => {
-    pushHistory(fullTileId, pixels);
+  const invertColors = useCallback(() => {
+    const before = new Uint8Array(pixels);
     const inverted = new Uint8Array(64);
     for (let i = 0; i < 64; i++) {
-      inverted[i] = (pixels[i] + 1) % 4;
+      inverted[i] = (before[i] + 1) % 4;
     }
     setPixels(inverted);
-    commitPixels(inverted);
-  };
+    commitPixels(inverted, fullTileId);
+    recordAction(fullTileId, before, inverted, 'Cycle Colors');
+  }, [fullTileId, pixels, commitPixels, recordAction]);
 
-  const clearTile = () => {
-    pushHistory(fullTileId, pixels);
+  const clearTile = useCallback(() => {
+    const before = new Uint8Array(pixels);
     const cleared = new Uint8Array(64);
     setPixels(cleared);
-    commitPixels(cleared);
-  };
+    commitPixels(cleared, fullTileId);
+    recordAction(fullTileId, before, cleared, 'Clear Tile');
+  }, [fullTileId, pixels, commitPixels, recordAction]);
 
-  const fillTile = () => {
-    pushHistory(fullTileId, pixels);
+  const fillTile = useCallback(() => {
+    const before = new Uint8Array(pixels);
     const filled = new Uint8Array(64);
     filled.fill(activeDrawColor);
     setPixels(filled);
-    commitPixels(filled);
-  };
+    commitPixels(filled, fullTileId);
+    recordAction(fullTileId, before, filled, `Fill (Color ${activeDrawColor})`);
+  }, [fullTileId, pixels, activeDrawColor, commitPixels, recordAction]);
 
   // Count how many times this tile is referenced in the nametable
   const screenUsageCount = useMemo(() => {
@@ -376,23 +552,43 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
 
         {/* Global Action Buttons */}
         <div className="flex flex-wrap items-center gap-1.5 self-start lg:self-auto">
-          {/* Undo / Redo */}
-          <button
-            onClick={handleUndo}
-            disabled={historyIndex <= 0}
-            className="p-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-neutral-300 border border-neutral-700 transition-colors"
-            title="Undo Tile Edit (Ctrl+Z)"
-          >
-            <Undo2 className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleRedo}
-            disabled={historyIndex >= history.length - 1}
-            className="p-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-neutral-300 border border-neutral-700 transition-colors"
-            title="Redo Tile Edit (Ctrl+Y)"
-          >
-            <Redo2 className="w-4 h-4" />
-          </button>
+          {/* Undo / Redo Stack Controls */}
+          <div className="flex items-center gap-1 bg-neutral-950 p-1 rounded-lg border border-neutral-800">
+            <button
+              onClick={handleUndo}
+              disabled={!canUndo}
+              className="px-2.5 py-1 rounded bg-neutral-900 hover:bg-neutral-800 disabled:opacity-35 disabled:hover:bg-neutral-900 text-neutral-200 disabled:text-neutral-500 border border-neutral-800 hover:border-neutral-700 text-xs flex items-center gap-1.5 transition-colors font-medium shadow-xs"
+              title={canUndo ? `Undo ${history[historyIndex]?.actionName || 'Edit'} (Ctrl+Z)` : 'Nothing to undo (Ctrl+Z)'}
+            >
+              <Undo2 className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Undo</span>
+            </button>
+            <button
+              onClick={handleRedo}
+              disabled={!canRedo}
+              className="px-2.5 py-1 rounded bg-neutral-900 hover:bg-neutral-800 disabled:opacity-35 disabled:hover:bg-neutral-900 text-neutral-200 disabled:text-neutral-500 border border-neutral-800 hover:border-neutral-700 text-xs flex items-center gap-1.5 transition-colors font-medium shadow-xs"
+              title={canRedo ? `Redo ${history[historyIndex + 1]?.actionName || 'Edit'} (Ctrl+Y or Ctrl+Shift+Z)` : 'Nothing to redo (Ctrl+Y)'}
+            >
+              <Redo2 className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Redo</span>
+            </button>
+
+            {/* History Stack Timeline Drawer Toggle */}
+            <button
+              onClick={() => setShowHistoryDrawer((prev) => !prev)}
+              className={`px-2 py-1 rounded border text-xs font-mono flex items-center gap-1.5 transition-colors ${
+                showHistoryDrawer
+                  ? 'bg-cyan-950/70 border-cyan-500/70 text-cyan-200'
+                  : 'bg-neutral-900 hover:bg-neutral-800 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Toggle Tile Edit History Stack Timeline"
+            >
+              <History className="w-3.5 h-3.5 text-cyan-400" />
+              <span>
+                {historyIndex + 1}/{history.length}
+              </span>
+            </button>
+          </div>
 
           <div className="h-5 w-px bg-neutral-800 mx-1" />
 
@@ -438,6 +634,95 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
           </div>
         </div>
       </div>
+
+      {/* History Timeline Drawer (Collapsible) */}
+      {showHistoryDrawer && (
+        <div className="p-3.5 bg-neutral-950 rounded-xl border border-neutral-800 space-y-2.5 transition-all text-xs">
+          <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
+            <span className="font-semibold text-neutral-200 flex items-center gap-2">
+              <History className="w-4 h-4 text-cyan-400" />
+              <span>Tile Edit History Timeline</span>
+              <span className="text-[11px] font-mono text-neutral-400">
+                ({history.length} action{history.length === 1 ? '' : 's'})
+              </span>
+            </span>
+            <div className="flex items-center gap-2">
+              {history.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleClearHistory}
+                  className="text-[11px] text-neutral-400 hover:text-rose-400 flex items-center gap-1 transition-colors px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 hover:border-rose-900/40"
+                  title="Clear entire undo/redo history"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>Clear History</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowHistoryDrawer(false)}
+                className="text-neutral-400 hover:text-white p-1 rounded hover:bg-neutral-900"
+                title="Close Drawer"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          {history.length === 0 ? (
+            <p className="text-[11px] text-neutral-500 py-3 text-center">
+              No modifications recorded yet. Edit pixels, flip horizontally/vertically, rotate, or shift tiles to record actions into the history stack.
+            </p>
+          ) : (
+            <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1 font-mono text-[11px]">
+              {history.map((entry, idx) => {
+                const isCurrent = idx === historyIndex;
+                const isPast = idx <= historyIndex;
+                const tileHex = '$' + (entry.tileId % 256).toString(16).padStart(2, '0').toUpperCase();
+                const tableLabel = entry.tileId < 256 ? '$0000' : '$1000';
+
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => jumpToHistory(idx)}
+                    className={`w-full text-left px-3 py-1.5 rounded-lg flex items-center justify-between transition-all border ${
+                      isCurrent
+                        ? 'bg-cyan-950/60 border-cyan-500/70 text-cyan-200 font-semibold shadow-xs'
+                        : isPast
+                        ? 'bg-neutral-900/80 border-neutral-800 text-neutral-300 hover:bg-neutral-800 hover:border-neutral-700'
+                        : 'bg-neutral-950/40 border-neutral-900 text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900/60'
+                    }`}
+                    title={`Jump to step ${idx + 1}: ${entry.actionName}`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 truncate">
+                      <span className={`w-5 text-right font-bold shrink-0 ${isCurrent ? 'text-cyan-400' : 'text-neutral-500'}`}>
+                        {idx + 1}.
+                      </span>
+                      <span className="truncate">{entry.actionName}</span>
+                      <span className="text-[10px] text-neutral-500 font-normal shrink-0">
+                        (Tile {tileHex} · {tableLabel})
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0 text-[10px]">
+                      {isCurrent && (
+                        <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[9px] font-bold uppercase tracking-wider">
+                          Active State
+                        </span>
+                      )}
+                      {!isPast && (
+                        <span className="text-neutral-600 text-[9px] uppercase tracking-wider font-semibold">
+                          Redoable
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Main Workspace Layout */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
@@ -723,8 +1008,29 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
                 </span>
               </span>
 
-              {/* Direct H-Flip and V-Flip Action Buttons above Canvas */}
+              {/* Direct Undo/Redo & H-Flip / V-Flip Action Buttons above Canvas */}
               <div className="flex items-center gap-1 ml-1.5">
+                <button
+                  type="button"
+                  onClick={handleUndo}
+                  disabled={!canUndo}
+                  className="px-2 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 disabled:opacity-30 border border-neutral-800 hover:border-cyan-600/50 text-neutral-300 disabled:text-neutral-600 text-[11px] font-medium flex items-center gap-1 transition-colors shadow-xs"
+                  title={canUndo ? `Undo ${history[historyIndex]?.actionName} (Ctrl+Z)` : 'Undo (Ctrl+Z)'}
+                >
+                  <Undo2 className="w-3 h-3 text-cyan-400" />
+                  <span className="hidden sm:inline">Undo</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRedo}
+                  disabled={!canRedo}
+                  className="px-2 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 disabled:opacity-30 border border-neutral-800 hover:border-cyan-600/50 text-neutral-300 disabled:text-neutral-600 text-[11px] font-medium flex items-center gap-1 transition-colors shadow-xs"
+                  title={canRedo ? `Redo ${history[historyIndex + 1]?.actionName} (Ctrl+Y)` : 'Redo (Ctrl+Y)'}
+                >
+                  <Redo2 className="w-3 h-3 text-cyan-400" />
+                  <span className="hidden sm:inline">Redo</span>
+                </button>
+                <div className="h-3.5 w-px bg-neutral-800 mx-0.5" />
                 <button
                   type="button"
                   onClick={flipTileH}
@@ -755,10 +1061,10 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
           <div
             className="relative select-none p-3 bg-neutral-900/90 rounded-xl border border-neutral-800 shadow-inner"
             onMouseLeave={() => {
-              setIsMouseDown(false);
               setHoveredPixel(null);
+              handleMouseUpOrLeave();
             }}
-            onMouseUp={() => setIsMouseDown(false)}
+            onMouseUp={handleMouseUpOrLeave}
           >
             {/* Column coordinate numbers */}
             <div className="grid grid-cols-8 gap-1 mb-1.5 text-center font-mono text-[10px] text-neutral-400">
@@ -790,16 +1096,10 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
                         <button
                           key={col}
                           type="button"
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            setIsMouseDown(true);
-                            setPixelAt(col, row);
-                          }}
+                          onMouseDown={(e) => handlePixelMouseDown(col, row, e)}
                           onMouseEnter={() => {
                             setHoveredPixel({ x: col, y: row, val: pixelVal });
-                            if (isMouseDown) {
-                              setPixelAt(col, row);
-                            }
+                            handlePixelMouseEnter(col, row);
                           }}
                           className={`w-8 h-8 sm:w-9 sm:h-9 rounded-md transition-all relative flex items-center justify-center font-mono text-[10px] font-bold border ${
                             isHovered
@@ -836,10 +1136,18 @@ export const PatternTableEditor: React.FC<PatternTableEditorProps> = ({
                   Bit0: {(hoveredPixel.val & 1)}, Bit1: {((hoveredPixel.val >> 1) & 1)}
                 </span>
               </div>
+            ) : history[historyIndex] ? (
+              <span className="text-neutral-300 flex items-center gap-2">
+                <span className="text-neutral-500">Last action:</span>
+                <strong className="text-cyan-300">{history[historyIndex].actionName}</strong>
+                <span className="text-[10px] text-neutral-500 font-mono">
+                  (History {historyIndex + 1}/{history.length})
+                </span>
+              </span>
             ) : (
               <span className="text-neutral-400 flex items-center gap-1.5">
                 <Info className="w-3.5 h-3.5" />
-                Click or drag across pixels to toggle / paint patterns
+                Click or drag across pixels to paint · Ctrl+Z to undo
               </span>
             )}
 
