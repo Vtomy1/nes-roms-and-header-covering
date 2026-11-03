@@ -15,13 +15,19 @@ export function renderFullNametableImage(
   const imgData = new ImageData(width, height);
   const data = imgData.data;
 
-  const { nametable, attributeTable, patternTable, subPalettes } = graphics;
+  const { nametable, attributeTable, patternTable, subPalettes, tileFlipTable } = graphics;
 
   // Screen is 32 tiles wide x 30 tiles high
   for (let ty = 0; ty < 30; ty++) {
     for (let tx = 0; tx < 32; tx++) {
-      const tileId = nametable[ty * 32 + tx];
+      const cellIdx = ty * 32 + tx;
+      const tileId = nametable[cellIdx];
       const byteOffset = tileId * 16;
+
+      // Check per-instance tile mirroring flags: bit 0 = H-flip, bit 1 = V-flip
+      const flipFlags = tileFlipTable ? tileFlipTable[cellIdx] : 0;
+      const hFlip = (flipFlags & 0x01) !== 0;
+      const vFlip = (flipFlags & 0x02) !== 0;
 
       // Determine subpalette from 16x16 macroblock attribute table, or use override
       let subpalId = overrideSubpalId;
@@ -36,13 +42,15 @@ export function renderFullNametableImage(
 
       const pal = subPalettes[subpalId]?.colors || subPalettes[0].colors;
 
-      // Decode 16 bytes for this 8x8 tile
+      // Decode 16 bytes for this 8x8 tile with optional H-flip and V-flip
       for (let row = 0; row < 8; row++) {
-        const plane0 = patternTable[byteOffset + row] || 0;
-        const plane1 = patternTable[byteOffset + row + 8] || 0;
+        const effectiveRow = vFlip ? 7 - row : row;
+        const plane0 = patternTable[byteOffset + effectiveRow] || 0;
+        const plane1 = patternTable[byteOffset + effectiveRow + 8] || 0;
 
         for (let col = 0; col < 8; col++) {
-          const shift = 7 - col;
+          const effectiveCol = hFlip ? 7 - col : col;
+          const shift = 7 - effectiveCol;
           const bit0 = (plane0 >> shift) & 1;
           const bit1 = (plane1 >> shift) & 1;
           const color2bit = bit0 | (bit1 << 1);
@@ -67,23 +75,28 @@ export function renderFullNametableImage(
 }
 
 /**
- * Renders a single 8x8 tile to a canvas context or returns a 64-pixel ImageData
+ * Renders a single 8x8 tile to a canvas context or returns a 64-pixel ImageData,
+ * with optional horizontal and vertical mirroring.
  */
 export function renderSingleTileImage(
   tileId: number,
   patternTable: Uint8Array,
-  subpalette: SubPalette
+  subpalette: SubPalette,
+  hFlip: boolean = false,
+  vFlip: boolean = false
 ): ImageData {
   const imgData = new ImageData(8, 8);
   const data = imgData.data;
   const byteOffset = tileId * 16;
 
   for (let row = 0; row < 8; row++) {
-    const plane0 = patternTable[byteOffset + row] || 0;
-    const plane1 = patternTable[byteOffset + row + 8] || 0;
+    const effectiveRow = vFlip ? 7 - row : row;
+    const plane0 = patternTable[byteOffset + effectiveRow] || 0;
+    const plane1 = patternTable[byteOffset + effectiveRow + 8] || 0;
 
     for (let col = 0; col < 8; col++) {
-      const shift = 7 - col;
+      const effectiveCol = hFlip ? 7 - col : col;
+      const shift = 7 - effectiveCol;
       const bit0 = (plane0 >> shift) & 1;
       const bit1 = (plane1 >> shift) & 1;
       const color2bit = bit0 | (bit1 << 1);
@@ -103,17 +116,24 @@ export function renderSingleTileImage(
 }
 
 /**
- * Flood fill algorithm for nametable tile placement
+ * Flood fill algorithm for nametable tile placement with per-instance flip support
  */
-export function floodFillNametable(
+export function floodFillNametableWithFlip(
   nametable: Uint8Array,
+  tileFlipTable: Uint8Array | undefined,
   startX: number,
   startY: number,
-  newTileId: number
-): Uint8Array {
-  const updated = new Uint8Array(nametable);
-  const targetTileId = updated[startY * 32 + startX];
-  if (targetTileId === newTileId) return updated;
+  newTileId: number,
+  newFlipBits: number = 0
+): { nametable: Uint8Array; tileFlipTable: Uint8Array } {
+  const updatedNametable = new Uint8Array(nametable);
+  const updatedFlipTable = tileFlipTable ? new Uint8Array(tileFlipTable) : new Uint8Array(32 * 30);
+  const targetTileId = updatedNametable[startY * 32 + startX];
+  const targetFlip = updatedFlipTable[startY * 32 + startX];
+
+  if (targetTileId === newTileId && targetFlip === newFlipBits) {
+    return { nametable: updatedNametable, tileFlipTable: updatedFlipTable };
+  }
 
   const queue: [number, number][] = [[startX, startY]];
   const visited = new Uint8Array(32 * 30);
@@ -126,8 +146,9 @@ export function floodFillNametable(
     if (visited[idx]) continue;
     visited[idx] = 1;
 
-    if (updated[idx] === targetTileId) {
-      updated[idx] = newTileId;
+    if (updatedNametable[idx] === targetTileId) {
+      updatedNametable[idx] = newTileId;
+      updatedFlipTable[idx] = newFlipBits;
 
       if (x > 0) queue.push([x - 1, y]);
       if (x < 31) queue.push([x + 1, y]);
@@ -136,7 +157,20 @@ export function floodFillNametable(
     }
   }
 
-  return updated;
+  return { nametable: updatedNametable, tileFlipTable: updatedFlipTable };
+}
+
+/**
+ * Legacy flood fill returning just nametable
+ */
+export function floodFillNametable(
+  nametable: Uint8Array,
+  startX: number,
+  startY: number,
+  newTileId: number
+): Uint8Array {
+  const result = floodFillNametableWithFlip(nametable, undefined, startX, startY, newTileId, 0);
+  return result.nametable;
 }
 
 /**

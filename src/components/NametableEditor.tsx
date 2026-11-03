@@ -6,6 +6,7 @@ import {
   renderQuadNametableImage,
   renderSingleTileImage,
   floodFillNametable,
+  floodFillNametableWithFlip,
   setAttributeSubpalette,
 } from '../utils/nametableRenderer';
 import {
@@ -30,6 +31,8 @@ import {
   Rows,
   ArrowLeftRight,
   ArrowDownUp,
+  FlipHorizontal,
+  FlipVertical,
   Monitor,
   Split,
   HardDrive,
@@ -49,6 +52,7 @@ type EditorTool = 'brush' | 'fill' | 'eyedropper' | 'attribute';
 interface HistoryState {
   nametable: Uint8Array;
   attributeTable: Uint8Array;
+  tileFlipTable: Uint8Array;
 }
 
 export const NametableEditor: React.FC<NametableEditorProps> = ({
@@ -60,10 +64,13 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const tilePickerCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const selectedTilePreviewRef = useRef<HTMLCanvasElement | null>(null);
 
   // Tools & State
   const [activeTool, setActiveTool] = useState<EditorTool>('brush');
   const [selectedTileId, setSelectedTileId] = useState<number>(0);
+  const [activeHFlip, setActiveHFlip] = useState<boolean>(false);
+  const [activeVFlip, setActiveVFlip] = useState<boolean>(false);
   const [selectedAttrSubpalette, setSelectedAttrSubpalette] = useState<number>(0);
   const [activePatternTable, setActivePatternTable] = useState<number>(0); // 0 = $0000, 1 = $1000
   const [zoomLevel, setZoomLevel] = useState<number>(2); // 1x, 2x, 3x
@@ -80,6 +87,8 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     ty: number;
     tileId: number;
     subpalId: number;
+    hFlip: boolean;
+    vFlip: boolean;
     ppuAddr: string;
     quadrantName?: string;
     isPage0?: boolean;
@@ -93,10 +102,17 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
 
   // Push current state to undo history before an edit
   const pushHistory = useCallback(
-    (nametable: Uint8Array, attributeTable: Uint8Array) => {
+    (nametable: Uint8Array, attributeTable: Uint8Array, tileFlipTable?: Uint8Array) => {
       setHistory((prev) => {
         const sliced = prev.slice(0, historyIndex + 1);
-        return [...sliced, { nametable: new Uint8Array(nametable), attributeTable: new Uint8Array(attributeTable) }];
+        return [
+          ...sliced,
+          {
+            nametable: new Uint8Array(nametable),
+            attributeTable: new Uint8Array(attributeTable),
+            tileFlipTable: tileFlipTable ? new Uint8Array(tileFlipTable) : new Uint8Array(960),
+          },
+        ];
       });
       setHistoryIndex((prev) => prev + 1);
     },
@@ -104,7 +120,7 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
   );
 
   // Undo action
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (historyIndex <= 0 || !graphics) return;
     const targetState = history[historyIndex - 1];
     setHistoryIndex(historyIndex - 1);
@@ -113,13 +129,14 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
       ...graphics,
       nametable: new Uint8Array(targetState.nametable),
       attributeTable: new Uint8Array(targetState.attributeTable),
+      tileFlipTable: new Uint8Array(targetState.tileFlipTable),
     };
     updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
     onUpdateGraphics(updatedGraphics);
-  };
+  }, [historyIndex, graphics, history, onUpdateGraphics]);
 
   // Redo action
-  const handleRedo = () => {
+  const handleRedo = useCallback(() => {
     if (historyIndex >= history.length - 1 || !graphics) return;
     const targetState = history[historyIndex + 1];
     setHistoryIndex(historyIndex + 1);
@@ -128,10 +145,11 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
       ...graphics,
       nametable: new Uint8Array(targetState.nametable),
       attributeTable: new Uint8Array(targetState.attributeTable),
+      tileFlipTable: new Uint8Array(targetState.tileFlipTable),
     };
     updatedGraphics.previewImageData = renderFullNametableImage(updatedGraphics);
     onUpdateGraphics(updatedGraphics);
-  };
+  }, [historyIndex, graphics, history, onUpdateGraphics]);
 
   // Initialize history when graphics are first loaded
   useEffect(() => {
@@ -139,6 +157,7 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
       setHistory([{
         nametable: new Uint8Array(graphics.nametable),
         attributeTable: new Uint8Array(graphics.attributeTable),
+        tileFlipTable: graphics.tileFlipTable ? new Uint8Array(graphics.tileFlipTable) : new Uint8Array(960),
       }]);
       setHistoryIndex(0);
     }
@@ -204,15 +223,39 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     ctx.putImageData(pickerImg, 0, 0);
   }, [graphics, activePatternTable, selectedAttrSubpalette]);
 
+  // Re-render single tile preview when tile, subpalette, or flip toggles change
+  useEffect(() => {
+    if (!graphics || !selectedTilePreviewRef.current) return;
+    const canvas = selectedTilePreviewRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = renderSingleTileImage(
+      selectedTileId,
+      graphics.patternTable,
+      graphics.subPalettes[selectedAttrSubpalette],
+      activeHFlip,
+      activeVFlip
+    );
+    ctx.putImageData(img, 0, 0);
+  }, [graphics, selectedTileId, selectedAttrSubpalette, activeHFlip, activeVFlip]);
+
   // Apply tool edit at tile coordinate (tx, ty)
   const applyToolAt = useCallback(
     (tx: number, ty: number) => {
       if (!graphics || tx < 0 || tx >= 32 || ty < 0 || ty >= 30) return;
 
-      const currentTile = graphics.nametable[ty * 32 + tx];
+      const cellIdx = ty * 32 + tx;
+      const currentTile = graphics.nametable[cellIdx];
+      const currentFlipTable = graphics.tileFlipTable ? new Uint8Array(graphics.tileFlipTable) : new Uint8Array(960);
+      const currentFlip = currentFlipTable[cellIdx];
+      const activeFlipBits = (activeHFlip ? 1 : 0) | (activeVFlip ? 2 : 0);
 
       if (activeTool === 'eyedropper') {
         setSelectedTileId(currentTile);
+        setActiveHFlip((currentFlip & 1) !== 0);
+        setActiveVFlip((currentFlip & 2) !== 0);
+
         // Also sample subpalette
         const bx = Math.floor(tx / 2);
         const by = Math.floor(ty / 2);
@@ -226,31 +269,42 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
       }
 
       if (activeTool === 'brush') {
-        if (currentTile === selectedTileId) return; // No change needed
-        pushHistory(graphics.nametable, graphics.attributeTable);
+        if (currentTile === selectedTileId && currentFlip === activeFlipBits) return; // No change needed
+        pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
 
         const newNametable = new Uint8Array(graphics.nametable);
-        newNametable[ty * 32 + tx] = selectedTileId;
+        newNametable[cellIdx] = selectedTileId;
+        const newFlipTable = new Uint8Array(currentFlipTable);
+        newFlipTable[cellIdx] = activeFlipBits;
 
         const updated: NESGraphicsData = {
           ...graphics,
           nametable: newNametable,
+          tileFlipTable: newFlipTable,
         };
         updated.previewImageData = renderFullNametableImage(updated);
         onUpdateGraphics(updated);
       } else if (activeTool === 'fill') {
-        if (currentTile === selectedTileId) return;
-        pushHistory(graphics.nametable, graphics.attributeTable);
+        if (currentTile === selectedTileId && currentFlip === activeFlipBits) return;
+        pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
 
-        const filled = floodFillNametable(graphics.nametable, tx, ty, selectedTileId);
+        const { nametable: filled, tileFlipTable: filledFlips } = floodFillNametableWithFlip(
+          graphics.nametable,
+          currentFlipTable,
+          tx,
+          ty,
+          selectedTileId,
+          activeFlipBits
+        );
         const updated: NESGraphicsData = {
           ...graphics,
           nametable: filled,
+          tileFlipTable: filledFlips,
         };
         updated.previewImageData = renderFullNametableImage(updated);
         onUpdateGraphics(updated);
       } else if (activeTool === 'attribute') {
-        pushHistory(graphics.nametable, graphics.attributeTable);
+        pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
         const updatedAttr = setAttributeSubpalette(
           graphics.attributeTable,
           tx,
@@ -265,8 +319,79 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
         onUpdateGraphics(updated);
       }
     },
-    [graphics, activeTool, selectedTileId, selectedAttrSubpalette, pushHistory, onUpdateGraphics]
+    [graphics, activeTool, selectedTileId, activeHFlip, activeVFlip, selectedAttrSubpalette, pushHistory, onUpdateGraphics]
   );
+
+  // Directly flip a specific cell on the nametable
+  const toggleCellFlip = useCallback(
+    (tx: number, ty: number, flipType: 'h' | 'v' | 'both') => {
+      if (!graphics || tx < 0 || tx >= 32 || ty < 0 || ty >= 30) return;
+      const cellIdx = ty * 32 + tx;
+      const currentFlipTable = graphics.tileFlipTable ? new Uint8Array(graphics.tileFlipTable) : new Uint8Array(960);
+      pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
+
+      const newFlipTable = new Uint8Array(currentFlipTable);
+      const curr = newFlipTable[cellIdx];
+      let next = curr;
+      if (flipType === 'h') {
+        next = curr ^ 1;
+      } else if (flipType === 'v') {
+        next = curr ^ 2;
+      } else {
+        next = curr ^ 3;
+      }
+      newFlipTable[cellIdx] = next;
+
+      const updated: NESGraphicsData = {
+        ...graphics,
+        tileFlipTable: newFlipTable,
+      };
+      updated.previewImageData = renderFullNametableImage(updated);
+      onUpdateGraphics(updated);
+    },
+    [graphics, pushHistory, onUpdateGraphics]
+  );
+
+  // Keyboard shortcuts: H = H-flip, V = V-flip, B = brush, F = fill, I = eyedropper, A = attribute
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
+
+      if (e.key === 'h' || e.key === 'H') {
+        e.preventDefault();
+        setActiveHFlip((prev) => !prev);
+      } else if (e.key === 'v' || e.key === 'V') {
+        e.preventDefault();
+        setActiveVFlip((prev) => !prev);
+      } else if (e.key === 'b' || e.key === 'B') {
+        setActiveTool('brush');
+      } else if (e.key === 'f' || e.key === 'F') {
+        setActiveTool('fill');
+      } else if (e.key === 'i' || e.key === 'I') {
+        setActiveTool('eyedropper');
+      } else if (e.key === 'a' || e.key === 'A') {
+        setActiveTool('attribute');
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo]);
 
   // Mouse handlers on main nametable canvas
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -346,10 +471,15 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
       const tx = Math.floor(subX / 8);
       const ty = Math.floor(subY / 8);
 
+      const cellIdx = ty * 32 + tx;
       const baseAddr = qy === 0 ? (qx === 0 ? 0x2000 : 0x2400) : (qx === 0 ? 0x2800 : 0x2C00);
-      const ppuAddr = '$' + (baseAddr + ty * 32 + tx).toString(16).toUpperCase();
+      const ppuAddr = '$' + (baseAddr + cellIdx).toString(16).toUpperCase();
 
-      const tileId = isPage0 ? (graphics.nametable[ty * 32 + tx] ?? 0) : 0;
+      const tileId = isPage0 ? (graphics.nametable[cellIdx] ?? 0) : 0;
+      const flipByte = (isPage0 && graphics.tileFlipTable) ? graphics.tileFlipTable[cellIdx] : 0;
+      const hFlip = (flipByte & 0x01) !== 0;
+      const vFlip = (flipByte & 0x02) !== 0;
+
       const bx = Math.floor(tx / 2);
       const by = Math.floor(ty / 2);
       const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
@@ -364,6 +494,8 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
         ty,
         tileId,
         subpalId,
+        hFlip,
+        vFlip,
         ppuAddr,
         quadrantName,
         isPage0,
@@ -377,21 +509,28 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     } else {
       const tx = Math.floor(rawX / 8);
       const ty = Math.floor(rawY / 8);
+      const cellIdx = ty * 32 + tx;
 
-      const tileId = graphics.nametable[ty * 32 + tx] ?? 0;
+      const tileId = graphics.nametable[cellIdx] ?? 0;
+      const flipByte = graphics.tileFlipTable ? graphics.tileFlipTable[cellIdx] : 0;
+      const hFlip = (flipByte & 0x01) !== 0;
+      const vFlip = (flipByte & 0x02) !== 0;
+
       const bx = Math.floor(tx / 2);
       const by = Math.floor(ty / 2);
       const attrIdx = Math.floor(by / 2) * 8 + Math.floor(bx / 2);
       const attrByte = graphics.attributeTable[attrIdx] || 0;
       const quadrant = ((by % 2) << 1) | (bx % 2);
       const subpalId = (attrByte >> (quadrant * 2)) & 0x03;
-      const ppuAddr = '$' + (0x2000 + ty * 32 + tx).toString(16).toUpperCase();
+      const ppuAddr = '$' + (0x2000 + cellIdx).toString(16).toUpperCase();
 
       setHoveredCell({
         tx,
         ty,
         tileId,
         subpalId,
+        hFlip,
+        vFlip,
         ppuAddr,
         quadrantName: 'NT 0 ($2000)',
         isPage0: true,
@@ -430,28 +569,36 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
     setSelectedTileId(tileId);
   };
 
-  // Clear all cells in nametable to blank ($00)
+  // Clear all cells in nametable to blank ($00) and reset flips
   const handleClearAll = () => {
     if (!graphics) return;
-    pushHistory(graphics.nametable, graphics.attributeTable);
+    const currentFlipTable = graphics.tileFlipTable ? new Uint8Array(graphics.tileFlipTable) : new Uint8Array(960);
+    pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
     const cleared = new Uint8Array(32 * 30);
+    const clearedFlips = new Uint8Array(32 * 30);
     const updated: NESGraphicsData = {
       ...graphics,
       nametable: cleared,
+      tileFlipTable: clearedFlips,
     };
     updated.previewImageData = renderFullNametableImage(updated);
     onUpdateGraphics(updated);
   };
 
-  // Fill entire screen with selected tile
+  // Fill entire screen with selected tile and current active flip
   const handleFillAll = () => {
     if (!graphics) return;
-    pushHistory(graphics.nametable, graphics.attributeTable);
+    const currentFlipTable = graphics.tileFlipTable ? new Uint8Array(graphics.tileFlipTable) : new Uint8Array(960);
+    pushHistory(graphics.nametable, graphics.attributeTable, currentFlipTable);
     const filled = new Uint8Array(32 * 30);
     filled.fill(selectedTileId);
+    const filledFlips = new Uint8Array(32 * 30);
+    const activeFlipBits = (activeHFlip ? 1 : 0) | (activeVFlip ? 2 : 0);
+    filledFlips.fill(activeFlipBits);
     const updated: NESGraphicsData = {
       ...graphics,
       nametable: filled,
+      tileFlipTable: filledFlips,
     };
     updated.previewImageData = renderFullNametableImage(updated);
     onUpdateGraphics(updated);
@@ -515,6 +662,38 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
           >
             <Redo2 className="w-4 h-4" />
           </button>
+
+          <div className="h-5 w-px bg-neutral-800 mx-1" />
+
+          {/* Instance Tile Mirroring Toggles */}
+          <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+            <button
+              onClick={() => setActiveHFlip((prev) => !prev)}
+              className={`px-2.5 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                activeHFlip
+                  ? 'bg-amber-600 text-white shadow-sm font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Toggle Tile Instance Horizontal Flip (Shortcut: H key)"
+            >
+              <FlipHorizontal className="w-3.5 h-3.5" />
+              <span>H-Flip</span>
+              <span className="text-[10px] opacity-75 font-mono">[H]</span>
+            </button>
+            <button
+              onClick={() => setActiveVFlip((prev) => !prev)}
+              className={`px-2.5 py-1 text-xs font-medium rounded flex items-center gap-1.5 transition-all ${
+                activeVFlip
+                  ? 'bg-amber-600 text-white shadow-sm font-semibold'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+              title="Toggle Tile Instance Vertical Flip (Shortcut: V key)"
+            >
+              <FlipVertical className="w-3.5 h-3.5" />
+              <span>V-Flip</span>
+              <span className="text-[10px] opacity-75 font-mono">[V]</span>
+            </button>
+          </div>
 
           <div className="h-5 w-px bg-neutral-800 mx-1" />
 
@@ -692,6 +871,89 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
             </div>
           </div>
 
+          {/* Instance Tile Mirroring (H-Flip & V-Flip) */}
+          <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-neutral-300 uppercase tracking-wider text-[11px] flex items-center gap-1.5">
+                <FlipHorizontal className="w-3.5 h-3.5 text-amber-400" />
+                <span>Tile Mirroring</span>
+              </span>
+              <span className="text-[10px] font-mono">
+                {activeHFlip || activeVFlip ? (
+                  <span className="text-amber-300 font-bold px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30">
+                    {activeHFlip && activeVFlip ? 'HV-Flip (180°)' : activeHFlip ? 'H-Flip (⇄)' : 'V-Flip (⇅)'}
+                  </span>
+                ) : (
+                  <span className="text-neutral-500">Normal (0°)</span>
+                )}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {/* H-Flip Toggle */}
+              <button
+                onClick={() => setActiveHFlip((prev) => !prev)}
+                className={`p-2 rounded-lg text-xs font-medium border flex items-center justify-between transition-all ${
+                  activeHFlip
+                    ? 'bg-amber-600/25 border-amber-500 text-amber-200 ring-1 ring-amber-500/40 shadow-sm font-semibold'
+                    : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:bg-neutral-800 hover:text-white'
+                }`}
+                title="Mirror tile horizontally (left-right) when placing. Shortcut: H key"
+              >
+                <div className="flex items-center gap-1.5">
+                  <FlipHorizontal className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>H-Flip</span>
+                </div>
+                <span className="text-[10px] font-mono px-1 py-0.5 rounded bg-black/40 text-neutral-400">
+                  [H]
+                </span>
+              </button>
+
+              {/* V-Flip Toggle */}
+              <button
+                onClick={() => setActiveVFlip((prev) => !prev)}
+                className={`p-2 rounded-lg text-xs font-medium border flex items-center justify-between transition-all ${
+                  activeVFlip
+                    ? 'bg-amber-600/25 border-amber-500 text-amber-200 ring-1 ring-amber-500/40 shadow-sm font-semibold'
+                    : 'bg-neutral-900 border-neutral-800 text-neutral-300 hover:bg-neutral-800 hover:text-white'
+                }`}
+                title="Mirror tile vertically (up-down) when placing. Shortcut: V key"
+              >
+                <div className="flex items-center gap-1.5">
+                  <FlipVertical className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>V-Flip</span>
+                </div>
+                <span className="text-[10px] font-mono px-1 py-0.5 rounded bg-black/40 text-neutral-400">
+                  [V]
+                </span>
+              </button>
+            </div>
+
+            {/* Status & Quick Clear */}
+            <div className="flex items-center justify-between pt-0.5 text-[11px]">
+              <span className="text-[11px] text-neutral-400 leading-tight">
+                {activeHFlip && activeVFlip
+                  ? 'Tiles stamp 180° rotated (H+V)'
+                  : activeHFlip
+                  ? 'Tiles stamp horizontally mirrored ⇄'
+                  : activeVFlip
+                  ? 'Tiles stamp vertically mirrored ⇅'
+                  : 'Standard unmirrored stamping'}
+              </span>
+              {(activeHFlip || activeVFlip) && (
+                <button
+                  onClick={() => {
+                    setActiveHFlip(false);
+                    setActiveVFlip(false);
+                  }}
+                  className="text-[10px] text-neutral-400 hover:text-amber-300 underline underline-offset-2 transition-colors ml-2 shrink-0 font-mono"
+                >
+                  Reset (0°)
+                </button>
+              )}
+            </div>
+          </div>
+
           {/* Active Brush / Stamp Preview */}
           <div className="p-3 bg-neutral-950 rounded-xl border border-neutral-800 space-y-2.5">
             <div className="flex items-center justify-between text-xs">
@@ -705,19 +967,7 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
               {/* Scaled preview of selected tile */}
               <div className="w-12 h-12 bg-black border border-neutral-700 rounded overflow-hidden flex items-center justify-center shrink-0">
                 <canvas
-                  ref={(canvas) => {
-                    if (canvas && graphics) {
-                      const ctx = canvas.getContext('2d');
-                      if (ctx) {
-                        const img = renderSingleTileImage(
-                          selectedTileId,
-                          graphics.patternTable,
-                          graphics.subPalettes[selectedAttrSubpalette]
-                        );
-                        ctx.putImageData(img, 0, 0);
-                      }
-                    }
-                  }}
+                  ref={selectedTilePreviewRef}
                   width={8}
                   height={8}
                   style={{ imageRendering: 'pixelated', width: 48, height: 48 }}
@@ -729,6 +979,25 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
                 <div>Screen Count: <strong className="text-amber-400">{tileUsageCount}</strong> tiles</div>
                 <div className="text-[10px] text-neutral-400">
                   Subpalette: #{selectedAttrSubpalette}
+                </div>
+                <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                  {activeHFlip && (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono text-[9px] border border-amber-500/40 flex items-center gap-0.5">
+                      <FlipHorizontal className="w-2.5 h-2.5" />
+                      H-Flip
+                    </span>
+                  )}
+                  {activeVFlip && (
+                    <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-mono text-[9px] border border-blue-500/40 flex items-center gap-0.5">
+                      <FlipVertical className="w-2.5 h-2.5" />
+                      V-Flip
+                    </span>
+                  )}
+                  {!activeHFlip && !activeVFlip && (
+                    <span className="text-[10px] text-neutral-500 font-mono">
+                      No Flip
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -918,6 +1187,40 @@ export const NametableEditor: React.FC<NametableEditorProps> = ({
                 <span className="text-neutral-400">
                   PPU: <strong className="text-emerald-400">{hoveredCell.ppuAddr}</strong>
                 </span>
+                <span className="flex items-center gap-1">
+                  Flip:
+                  {hoveredCell.hFlip || hoveredCell.vFlip ? (
+                    <strong className="text-amber-300 font-bold">
+                      {hoveredCell.hFlip && hoveredCell.vFlip
+                        ? 'HV (⤧)'
+                        : hoveredCell.hFlip
+                        ? 'H (⇄)'
+                        : 'V (⇅)'}
+                    </strong>
+                  ) : (
+                    <span className="text-neutral-500">None</span>
+                  )}
+                </span>
+                {hoveredCell.isPage0 && (
+                  <div className="flex items-center gap-1 ml-1">
+                    <button
+                      onClick={() => toggleCellFlip(hoveredCell.tx, hoveredCell.ty, 'h')}
+                      className="px-1.5 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 hover:border-amber-500/60 text-[10px] text-neutral-300 hover:text-amber-300 flex items-center gap-1 transition-colors"
+                      title="Toggle horizontal flip directly on this hovered cell"
+                    >
+                      <FlipHorizontal className="w-3 h-3 text-amber-400" />
+                      <span>Flip H</span>
+                    </button>
+                    <button
+                      onClick={() => toggleCellFlip(hoveredCell.tx, hoveredCell.ty, 'v')}
+                      className="px-1.5 py-0.5 rounded bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 hover:border-amber-500/60 text-[10px] text-neutral-300 hover:text-amber-300 flex items-center gap-1 transition-colors"
+                      title="Toggle vertical flip directly on this hovered cell"
+                    >
+                      <FlipVertical className="w-3 h-3 text-amber-400" />
+                      <span>Flip V</span>
+                    </button>
+                  </div>
+                )}
                 {hoveredCell.quadrantName && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-amber-300">
                     {hoveredCell.quadrantName}

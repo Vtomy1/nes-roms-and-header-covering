@@ -392,6 +392,7 @@ export async function convertImageToNES(
     patternTable,
     uniqueTilesCount: rawUniqueTiles.length,
     nametable,
+    tileFlipTable: new Uint8Array(960),
     attributeTable,
     previewImageData: previewData,
   };

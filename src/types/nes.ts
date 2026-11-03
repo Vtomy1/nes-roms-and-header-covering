@@ -54,6 +54,7 @@ export interface NESGraphicsData {
   patternTable: Uint8Array; // 8192 bytes (512 tiles * 16 bytes)
   uniqueTilesCount: number;
   nametable: Uint8Array; // 960 bytes (32x30 tile indices)
+  tileFlipTable?: Uint8Array; // 960 bytes: bit 0 (0x01) = H-flip, bit 1 (0x02) = V-flip
   attributeTable: Uint8Array; // 64 bytes (16x16 attribute data)
   previewImageData?: ImageData;
 }
